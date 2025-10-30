@@ -179,8 +179,7 @@ pycosat
 pycparser
 pyct
 Pygments
-#pylibcudf==24.12.0
-#pylibcudf
+pylibcudf==24.12.0
 pylibcugraph
 pylibraft
 pynndescent==0.5.13
@@ -200,6 +199,7 @@ PyYAML
 pyzmq
 raft-dask
 rapids-dask-dependency
+-e git+https://github.com/scverse/rapids_singlecell.git@d9059fd6426d97041017624256dae2a4a973670e#egg=rapids_singlecell
 referencing
 requests
 rfc3339_validator
