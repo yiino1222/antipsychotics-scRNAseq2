@@ -53,7 +53,7 @@ def load_parameters():
 def set_parameters_for_preprocess(GPCR_list):
     params = {}  # Create an empty dictionary to store parameters
     # maximum number of cells to load from files
-    params["USE_FIRST_N_CELLS"] = 300000
+    params["USE_FIRST_N_CELLS"] = 30000
     
     # Set MITO_GENE_PREFIX
     params['MITO_GENE_PREFIX'] = "mt-"
@@ -453,10 +453,11 @@ def UMAP_adata(adata,n_neighbors,knn_n_pcs,umap_min_dist,umap_spread):
                     method='rapids')
     sc.tl.umap(adata, min_dist=umap_min_dist, spread=umap_spread,
                method='rapids')
-    sc.tl.louvain(adata, flavor='rapids')
+    sc.tl.louvain(adata, flavor='igraph')
     print("UMAP louvain")
     sc.pl.umap(adata, color=["louvain"])
-    adata.obs['leiden'] = rapids_scanpy_funcs.leiden(adata)
+    #adata.obs['leiden'] = rapids_scanpy_funcs.leiden(adata)
+    sc.tl.leiden(adata, flavor='igraph')
     print("UMAP leiden")
     sc.pl.umap(adata, color=["leiden"])
     return adata
