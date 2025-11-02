@@ -1,8 +1,10 @@
 {
 	"folders": [
 		{
-			"name": "antipsychotics-scRNAseq2",
 			"path": "."
+		},
+		{
+			"path": "../data"
 		}
 	],
 	"settings": {}
