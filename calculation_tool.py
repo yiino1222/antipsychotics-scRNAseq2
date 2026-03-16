@@ -188,13 +188,25 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
     
     # scale
     print("perform scale")
-    mean = sparse_gpu_array.mean(axis=0)
-    sparse_gpu_array -= mean
-    stddev = cp.sqrt(sparse_gpu_array.var(axis=0))
-    sparse_gpu_array /= stddev
+    try:
+        mean = sparse_gpu_array.mean(axis=0)
+        sparse_gpu_array -= mean
+        stddev = cp.sqrt(sparse_gpu_array.var(axis=0))
+        stddev = cp.where(stddev == 0, 1, stddev)
+        sparse_gpu_array /= stddev
+        sparse_gpu_array = sparse_gpu_array.clip(None,10)
+        del mean, stddev
+    except Exception as err:
+        print(f"Sparse GPU scaling failed ({type(err).__name__}: {err}).")
+        print("Fallback: convert to dense float32 and run StandardScaler-based scaling.")
+        cp.cuda.runtime.deviceSynchronize()
+        dense_gpu_array = sparse_gpu_array.toarray().astype(cp.float32)
+        del sparse_gpu_array
+        gc.collect()
+        cp.get_default_memory_pool().free_all_blocks()
+        sparse_gpu_array = rapids_scanpy_funcs.scale(dense_gpu_array, max_value=10)
+        del dense_gpu_array
     print(sparse_gpu_array.dtype)
-    sparse_gpu_array = sparse_gpu_array.clip(None,10)
-    del mean, stddev
     gc.collect()
     cp.get_default_memory_pool().free_all_blocks()
     
