@@ -188,13 +188,56 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
     
     # scale
     print("perform scale")
-    mean = sparse_gpu_array.mean(axis=0)
-    sparse_gpu_array -= mean
-    stddev = cp.sqrt(sparse_gpu_array.var(axis=0))
-    sparse_gpu_array /= stddev
+    from sklearn.preprocessing import StandardScaler as SkStandardScaler
+
+    def _scale_on_cpu(cpu_matrix):
+        cpu_matrix = SkStandardScaler().fit_transform(cpu_matrix)
+        return np.clip(cpu_matrix, -10, 10).astype(np.float32)
+
+    def _to_cpu_dense(array_like):
+        if isinstance(array_like, np.ndarray):
+            return array_like.astype(np.float32, copy=False)
+        if cp.sparse.issparse(array_like):
+            return array_like.toarray().get().astype(np.float32, copy=False)
+        if isinstance(array_like, cp.ndarray):
+            return cp.asnumpy(array_like).astype(np.float32, copy=False)
+        if scipy.sparse.issparse(array_like):
+            return array_like.toarray().astype(np.float32, copy=False)
+        return np.asarray(array_like, dtype=np.float32)
+
+    if not is_gpu:
+        print("is_gpu=False: run CPU scaling path.")
+        dense_cpu_array = _to_cpu_dense(sparse_gpu_array)
+        sparse_gpu_array = _scale_on_cpu(dense_cpu_array)
+    else:
+        host_fallback = None
+        try:
+            # Capture host fallback BEFORE running risky GPU scaling kernels.
+            host_fallback = _to_cpu_dense(sparse_gpu_array)
+        except Exception as host_err:
+            print(f"Host fallback snapshot failed ({type(host_err).__name__}: {host_err}).")
+
+        try:
+            if cp.sparse.issparse(sparse_gpu_array):
+                dense_gpu_array = sparse_gpu_array.toarray().astype(cp.float32)
+            elif isinstance(sparse_gpu_array, cp.ndarray):
+                dense_gpu_array = sparse_gpu_array.astype(cp.float32)
+            elif isinstance(sparse_gpu_array, np.ndarray):
+                dense_gpu_array = cp.asarray(sparse_gpu_array, dtype=cp.float32)
+            else:
+                raise TypeError(f"Unsupported array type for GPU scaling: {type(sparse_gpu_array)}")
+            del sparse_gpu_array
+            gc.collect()
+            cp.get_default_memory_pool().free_all_blocks()
+            sparse_gpu_array = rapids_scanpy_funcs.scale(dense_gpu_array, max_value=10)
+            del dense_gpu_array
+        except Exception as err:
+            print(f"GPU scaling failed ({type(err).__name__}: {err}).")
+            print("Fallback: run CPU StandardScaler and continue.")
+            if host_fallback is None:
+                raise RuntimeError("GPU scaling failed and no host fallback snapshot is available.") from err
+            sparse_gpu_array = _scale_on_cpu(host_fallback)
     print(sparse_gpu_array.dtype)
-    sparse_gpu_array = sparse_gpu_array.clip(None,10)
-    del mean, stddev
     gc.collect()
     cp.get_default_memory_pool().free_all_blocks()
     
@@ -202,7 +245,11 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
     print("Total Preprocessing time: %s" % (preprocess_time-preprocess_start))
     
     ## Cluster and visualize
-    adata = anndata.AnnData(sparse_gpu_array.get())
+    if isinstance(sparse_gpu_array, cp.ndarray):
+        adata_matrix = sparse_gpu_array.get()
+    else:
+        adata_matrix = sparse_gpu_array
+    adata = anndata.AnnData(adata_matrix)
     adata.var_names = genes.to_pandas()
     adata.obs_names = filtered_barcodes.to_pandas()
     print(f"shape of adata: {adata.X.shape}")
@@ -337,7 +384,7 @@ def preprocess_adata_in_batch(adata_path,max_cells):
         i += 1
 
     #Filter the count matrix to retain only the most variable genes.
-    hvg = rapids_scanpy_funcs.highly_variable_genes_filter(client, dask_sparse_arr, genes, n_top_genes=n_top_genes)
+    hvg = rapids_scanpy_funcs.highly_variable_genes_filter(client, dask_sparse_arr, genes, n_top_genes=params['n_top_genes'])
 
     genes = genes[hvg]
     dask_sparse_arr = dask_sparse_arr[:, hvg]
@@ -384,7 +431,11 @@ def preprocess_adata_in_batch(adata_path,max_cells):
     print("Total Preprocessing time: %s" % (preprocess_time-preprocess_start))
     
     ## Cluster and visualize
-    adata = anndata.AnnData(sparse_gpu_array.get())
+    if isinstance(sparse_gpu_array, cp.ndarray):
+        adata_matrix = sparse_gpu_array.get()
+    else:
+        adata_matrix = sparse_gpu_array
+    adata = anndata.AnnData(adata_matrix)
     adata.var_names = genes.to_pandas()
     del sparse_gpu_array, genes
     print(f"shape of adata: {adata.X.shape}")
