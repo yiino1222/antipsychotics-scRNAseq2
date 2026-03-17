@@ -384,7 +384,7 @@ def preprocess_adata_in_batch(adata_path,max_cells):
         i += 1
 
     #Filter the count matrix to retain only the most variable genes.
-    hvg = rapids_scanpy_funcs.highly_variable_genes_filter(client, dask_sparse_arr, genes, n_top_genes=n_top_genes)
+    hvg = rapids_scanpy_funcs.highly_variable_genes_filter(client, dask_sparse_arr, genes, n_top_genes=params['n_top_genes'])
 
     genes = genes[hvg]
     dask_sparse_arr = dask_sparse_arr[:, hvg]
