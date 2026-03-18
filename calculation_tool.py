@@ -4,14 +4,6 @@ import anndata
 
 import time
 import os, wget
-import cudf
-
-from cuml.decomposition import PCA
-from cuml.manifold import TSNE
-from cuml.cluster import KMeans
-from cuml.preprocessing import StandardScaler
-
-import rapids_scanpy_funcs
 import utils
 
 import warnings
@@ -22,7 +14,6 @@ from sh import gunzip
 import scipy
 from scipy import sparse
 import gc
-import cupy as cp
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -96,6 +87,9 @@ def set_parameters_for_preprocess(GPCR_list):
     return params
 
 def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True):
+    import cudf
+    import cupy as cp
+    import rapids_scanpy_funcs
     preprocess_start = time.time()
     D_R_mtx,GPCR_type_df,drug_list,GPCR_list=load_parameters()
     # Set parameters
@@ -314,6 +308,7 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
     return adata,GPCR_df
 
 def preprocess_adata_in_batch(adata_path,max_cells):
+    import rapids_scanpy_funcs
     import dask
     from dask_cuda import initialize, LocalCUDACluster
     from dask.distributed import Client, default_client
@@ -492,6 +487,8 @@ def preprocess_adata_in_batch(adata_path,max_cells):
     return adata,GPCR_df
 
 def tsne_kmeans(adata,tsne_n_pcs,k):
+    from cuml.manifold import TSNE
+    from cuml.cluster import KMeans
     adata.obsm['X_tsne'] = TSNE().fit_transform(adata.obsm["X_pca"][:,:tsne_n_pcs])
     kmeans = KMeans(n_clusters=k, init="k-means++", random_state=0).fit(adata.obsm['X_pca'])
     adata.obs['kmeans'] = kmeans.labels_.astype(str) 
