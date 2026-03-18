@@ -4,14 +4,6 @@ import anndata
 
 import time
 import os, wget
-import cudf
-
-from cuml.decomposition import PCA
-from cuml.manifold import TSNE
-from cuml.cluster import KMeans
-from cuml.preprocessing import StandardScaler
-
-import rapids_scanpy_funcs
 import utils
 
 import warnings
@@ -22,7 +14,6 @@ from sh import gunzip
 import scipy
 from scipy import sparse
 import gc
-import cupy as cp
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -96,6 +87,9 @@ def set_parameters_for_preprocess(GPCR_list):
     return params
 
 def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True):
+    import cudf
+    import cupy as cp
+    import rapids_scanpy_funcs
     preprocess_start = time.time()
     D_R_mtx,GPCR_type_df,drug_list,GPCR_list=load_parameters()
     # Set parameters
@@ -188,13 +182,56 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
     
     # scale
     print("perform scale")
-    mean = sparse_gpu_array.mean(axis=0)
-    sparse_gpu_array -= mean
-    stddev = cp.sqrt(sparse_gpu_array.var(axis=0))
-    sparse_gpu_array /= stddev
+    from sklearn.preprocessing import StandardScaler as SkStandardScaler
+
+    def _scale_on_cpu(cpu_matrix):
+        cpu_matrix = SkStandardScaler().fit_transform(cpu_matrix)
+        return np.clip(cpu_matrix, -10, 10).astype(np.float32)
+
+    def _to_cpu_dense(array_like):
+        if isinstance(array_like, np.ndarray):
+            return array_like.astype(np.float32, copy=False)
+        if cp.sparse.issparse(array_like):
+            return array_like.toarray().get().astype(np.float32, copy=False)
+        if isinstance(array_like, cp.ndarray):
+            return cp.asnumpy(array_like).astype(np.float32, copy=False)
+        if scipy.sparse.issparse(array_like):
+            return array_like.toarray().astype(np.float32, copy=False)
+        return np.asarray(array_like, dtype=np.float32)
+
+    if not is_gpu:
+        print("is_gpu=False: run CPU scaling path.")
+        dense_cpu_array = _to_cpu_dense(sparse_gpu_array)
+        sparse_gpu_array = _scale_on_cpu(dense_cpu_array)
+    else:
+        host_fallback = None
+        try:
+            # Capture host fallback BEFORE running risky GPU scaling kernels.
+            host_fallback = _to_cpu_dense(sparse_gpu_array)
+        except Exception as host_err:
+            print(f"Host fallback snapshot failed ({type(host_err).__name__}: {host_err}).")
+
+        try:
+            if cp.sparse.issparse(sparse_gpu_array):
+                dense_gpu_array = sparse_gpu_array.toarray().astype(cp.float32)
+            elif isinstance(sparse_gpu_array, cp.ndarray):
+                dense_gpu_array = sparse_gpu_array.astype(cp.float32)
+            elif isinstance(sparse_gpu_array, np.ndarray):
+                dense_gpu_array = cp.asarray(sparse_gpu_array, dtype=cp.float32)
+            else:
+                raise TypeError(f"Unsupported array type for GPU scaling: {type(sparse_gpu_array)}")
+            del sparse_gpu_array
+            gc.collect()
+            cp.get_default_memory_pool().free_all_blocks()
+            sparse_gpu_array = rapids_scanpy_funcs.scale(dense_gpu_array, max_value=10)
+            del dense_gpu_array
+        except Exception as err:
+            print(f"GPU scaling failed ({type(err).__name__}: {err}).")
+            print("Fallback: run CPU StandardScaler and continue.")
+            if host_fallback is None:
+                raise RuntimeError("GPU scaling failed and no host fallback snapshot is available.") from err
+            sparse_gpu_array = _scale_on_cpu(host_fallback)
     print(sparse_gpu_array.dtype)
-    sparse_gpu_array = sparse_gpu_array.clip(None,10)
-    del mean, stddev
     gc.collect()
     cp.get_default_memory_pool().free_all_blocks()
     
@@ -202,7 +239,11 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
     print("Total Preprocessing time: %s" % (preprocess_time-preprocess_start))
     
     ## Cluster and visualize
-    adata = anndata.AnnData(sparse_gpu_array.get())
+    if isinstance(sparse_gpu_array, cp.ndarray):
+        adata_matrix = sparse_gpu_array.get()
+    else:
+        adata_matrix = sparse_gpu_array
+    adata = anndata.AnnData(adata_matrix)
     adata.var_names = genes.to_pandas()
     adata.obs_names = filtered_barcodes.to_pandas()
     print(f"shape of adata: {adata.X.shape}")
@@ -267,180 +308,104 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
     return adata,GPCR_df
 
 def preprocess_adata_in_batch(adata_path,max_cells):
-    import dask
-    from dask_cuda import initialize, LocalCUDACluster
-    from dask.distributed import Client, default_client
-    import rmm
-    import cupy as cp
-    from rmm.allocators.cupy import rmm_cupy_allocator
-
-    def set_mem():
-        rmm.reinitialize(managed_memory=True)
-        cp.cuda.set_allocator(rmm_cupy_allocator)
-
     preprocess_start = time.time()
-    #Set `preprocessing_gpus` below to specify the GPUs to use for preprocessing. 
-    # For example, numbers 0-7 can be used on a machine with 8 gpus. Specifying a specific number,
-    #  such as 5, will use only the 6th GPU on the machine. In practice, 
-    # it's often a good idea to use GPUs 1-7 for pre-processing and GPU0 for downstream clustering, 
-    # visualization, and differential gene expression steps. 
-    preprocessing_gpus="1, 2, 3"
-    cluster = LocalCUDACluster(CUDA_VISIBLE_DEVICES=preprocessing_gpus)
-    client = Client(cluster)    
 
-    set_mem()
-    client.run(set_mem)
-    client
-    n_workers = len(client.scheduler_info()['workers'])
-    #load parameters
+    if max_cells is None:
+        max_cells = int(os.environ.get("SCBATCH_MAX_CELLS", "50000"))
+        print(f"max_cells is None. Use safety default: {max_cells}")
+
+    print("preprocess_in_batches (safe CPU path)")
     D_R_mtx,GPCR_type_df,drug_list,GPCR_list=load_parameters()
-    #set parameters
-    params=set_parameters_for_preprocess(GPCR_list)
-    
-    #preprocess in batch
-    print("preprocess_in_batches")
+    params = set_parameters_for_preprocess(GPCR_list)
 
-    #Below, we load the sparse count matrix from the `.h5ad` file into GPU using a custom function. 
-    # While reading the dataset, filters are applied on the count matrix to remove cells with 
-    # an extreme number of genes expressed. Genes will zero expression in all cells are also eliminated. 
+    backed = anndata.read_h5ad(adata_path, backed="r")
+    n_obs = min(backed.n_obs, max_cells) if max_cells is not None else backed.n_obs
+    adata = backed[:n_obs].to_memory()
+    if hasattr(backed, 'file') and backed.file is not None:
+        backed.file.close()
 
-    #The custom function uses [Dask](https://dask.org) to partition data. 
-    # The above mentioned filters are applied on individual partitions. 
-    # Usage of Dask along with cupy provides the following benefits:
-    #- Parallelized data loading when multiple GPUs are available
-    #- Ability to partition the data allows pre-processing large datasets
+    adata.var_names = pd.Index([str(x).upper() for x in adata.var_names])
 
-    #Filters are applied on individual batches of cells. 
-    # Elementwise or cell-level normalization operations are also performed while reading. 
-    # For this example, the following two operations are performed:
-    #- Normalize the count matrix so that the total counts in each cell sum to 1e4.
-    #- Log transform the count matrix.
+    sc.pp.filter_cells(adata, min_genes=params['min_genes_per_cell'])
+    adata = adata[np.asarray(adata.X.getnnz(axis=1)).ravel() <= params['max_genes_per_cell']].copy() if scipy.sparse.issparse(adata.X) else adata[(adata.X > 0).sum(axis=1) <= params['max_genes_per_cell']].copy()
+    sc.pp.filter_genes(adata, min_cells=params['min_cells_per_gene'])
 
-    def partial_post_processor(partial_data):
-        partial_data = rapids_scanpy_funcs.normalize_total(partial_data, target_sum=1e4)
-        return partial_data.log1p()
-
-    dask_sparse_arr, genes, query = rapids_scanpy_funcs.read_with_filter(client,
-                                                        adata_path,
-                                                        min_genes_per_cell=params['min_genes_per_cell'],
-                                                        max_genes_per_cell=params['max_genes_per_cell'],
-                                                        partial_post_processor=partial_post_processor)
-    dask_sparse_arr = dask_sparse_arr.persist()
-    dask_sparse_arr.shape
-
-    # Select Most Variable Genes
-    markers=params['markers']
+    markers = params['markers'].copy()
     marker_genes_raw = {}
-    i = 0
-    for index in genes[genes.isin(markers)].index.to_arrow().to_pylist():
-        marker_genes_raw[markers[i]] = dask_sparse_arr[:, index].compute().toarray().ravel()
-        i += 1
+    for marker in markers:
+        if marker not in adata.var_names:
+            print(f"{marker} is not included")
+            continue
+        marker_values = adata[:, marker].X
+        if scipy.sparse.issparse(marker_values):
+            marker_values = marker_values.toarray()
+        marker_genes_raw[f"{marker}_raw"] = np.asarray(marker_values).ravel()
 
-    #Filter the count matrix to retain only the most variable genes.
-    hvg = rapids_scanpy_funcs.highly_variable_genes_filter(client, dask_sparse_arr, genes, n_top_genes=n_top_genes)
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
 
-    genes = genes[hvg]
-    dask_sparse_arr = dask_sparse_arr[:, hvg]
-    sparse_gpu_array = dask_sparse_arr.compute()
+    mito_genes = adata.var_names.str.startswith(params['MITO_GENE_PREFIX'].upper())
+    if mito_genes.any():
+        mito_sum = adata[:, mito_genes].X.sum(axis=1)
+        total_sum = adata.X.sum(axis=1)
+        mito_sum = np.asarray(mito_sum).ravel()
+        total_sum = np.asarray(total_sum).ravel()
+        total_sum = np.where(total_sum == 0, 1, total_sum)
+        adata.obs['percent_mito'] = mito_sum / total_sum
+    else:
+        adata.obs['percent_mito'] = 0.0
+    adata.obs['n_counts'] = np.asarray(adata.X.sum(axis=1)).ravel()
 
-    del hvg
+    print("perform hvg")
+    sc.pp.highly_variable_genes(adata, n_top_genes=params['n_top_genes'], subset=True)
 
-    print("marker_genes_raw")
-    print(marker_genes_raw)
-    ## Regress out confounding factors (number of counts, mitochondrial gene expression)
-    # calculate the total counts and the percentage of mitochondrial counts for each cell
-    mito_genes = genes.str.startswith(params['MITO_GENE_PREFIX']).values
-
-    n_counts = sparse_gpu_array.sum(axis=1)
-    percent_mito = (sparse_gpu_array[:,mito_genes].sum(axis=1) / n_counts).ravel()
-
-    n_counts = cp.array(n_counts).ravel()
-    percent_mito = cp.array(percent_mito).ravel()
-    
-    # regression
     print("perform regression")
-    n_rows = dask_sparse_arr.shape[0]
-    n_cols = dask_sparse_arr.shape[1]
-    cols_per_worker = int(n_cols / n_workers)
-    dask_sparse_arr = dask_sparse_arr.map_blocks(lambda x: x.todense(), dtype="float32", meta=cp.array(cp.zeros((0,)))).T
-    dask_sparse_arr = dask_sparse_arr.rechunk((cols_per_worker, n_rows)).persist()
-    dask_sparse_arr.compute_chunk_sizes()
+    sc.pp.regress_out(adata, ['n_counts', 'percent_mito'])
 
-    import math
-    dask_sparse_arr = dask_sparse_arr.map_blocks(lambda x: rapids_scanpy_funcs.regress_out(x.T, n_counts, percent_mito).T, dtype="float32", meta=cp.array(cp.zeros(0,))).T
-    dask_sparse_arr = dask_sparse_arr.rechunk((math.ceil(n_rows/n_workers), n_cols)).persist()
-    dask_sparse_arr.compute_chunk_sizes()
-
-    # scale
     print("perform scale")
-    mean = dask_sparse_arr.mean(axis=0)
-    dask_sparse_arr -= mean
-    stddev = cp.sqrt(dask_sparse_arr.var(axis=0).compute())
-    dask_sparse_arr /= stddev
-    dask_sparse_arr = dask.array.clip(dask_sparse_arr, -10, 10).persist()
-    del mean, stddev
-    
+    sc.pp.scale(adata, max_value=10)
+    if adata.X.dtype != np.float32:
+        adata.X = adata.X.astype(np.float32)
+
     preprocess_time = time.time()
     print("Total Preprocessing time: %s" % (preprocess_time-preprocess_start))
-    
-    ## Cluster and visualize
-    adata = anndata.AnnData(sparse_gpu_array.get())
-    adata.var_names = genes.to_pandas()
-    del sparse_gpu_array, genes
-    print(f"shape of adata: {adata.X.shape}")
-    
-    GPCR_df=pd.DataFrame()
+
+    print("perform PCA")
+    adata = utils.pca(
+        adata,
+        n_components=params['n_components'],
+        train_ratio=params['pca_train_ratio'],
+        n_batches=params['n_pca_batches'],
+        gpu=False,
+    )
+
+    GPCR_df = pd.DataFrame(index=adata.obs_names)
     for name, data in marker_genes_raw.items():
-        print(len(adata.obs[name]))
-        print(len(data.get()))
-        adata.obs[name] = data.get()
-        if   name[:-4] in GPCR_list:
-            GPCR_df[name]=data.get()
-        
-    # Deminsionality reduction
-    #We use PCA to reduce the dimensionality of the matrix to its top 50 principal components.
-    from cuml.dask.decomposition import PCA
-    pca_data = PCA(n_components=50).fit_transform(dask_sparse_arr)
-    pca_data.compute_chunk_sizes()
+        marker_values = np.asarray(data).ravel()
+        adata.obs[name] = marker_values
+        if name[:-4] in GPCR_list:
+            GPCR_df[name] = marker_values
 
-    #We store the preprocessed count matrix as an AnnData object, 
-    # which is currently in host memory. We also add the expression levels of 
-    # the marker genes as observations to the annData object.
-    local_pca = pca_data.compute()
-    X = dask_sparse_arr.compute().get()
-
-    adata = anndata.AnnData(X=X)
-    adata.var_names = genes.to_numpy()
-    adata.obsm["X_pca"] = local_pca.get()
-
-    del pca_data
-    del dask_sparse_arr
-    
-    #UMAP + Graph clustering
     print("UMAP")
     adata=UMAP_adata(adata,params["n_neighbors"],params["knn_n_pcs"],
                      params["umap_min_dist"],params["umap_spread"])
-   
-    #calculate response to antipsychotics
+
     print("calc drug response")
     default_drug_conc=100
     adata=calc_drug_response(adata,GPCR_df,GPCR_type_df,drug_list,D_R_mtx,default_drug_conc)
-    
-    #calculate clz selectivity
+
     selectivity_threshold=1.2
     adata,num_clz_selective_cells=calc_clz_selective_cell(adata,drug_list,selectivity_threshold)
-    
-    #save preprocessed adata 
+
     file_root, file_extension = os.path.splitext(adata_path)
-    # Append '_processed' to the root and add the extension back
     processed_file_path = f"{file_root}_processed{file_extension}"
     adata.write(processed_file_path)
-    client.shutdown()
-    cluster.close()
-    
+
     return adata,GPCR_df
 
 def tsne_kmeans(adata,tsne_n_pcs,k):
+    from cuml.manifold import TSNE
+    from cuml.cluster import KMeans
     adata.obsm['X_tsne'] = TSNE().fit_transform(adata.obsm["X_pca"][:,:tsne_n_pcs])
     kmeans = KMeans(n_clusters=k, init="k-means++", random_state=0).fit(adata.obsm['X_pca'])
     adata.obs['kmeans'] = kmeans.labels_.astype(str) 
@@ -449,14 +414,18 @@ def tsne_kmeans(adata,tsne_n_pcs,k):
     return adata
 
 def UMAP_adata(adata,n_neighbors,knn_n_pcs,umap_min_dist,umap_spread):
-    sc.pp.neighbors(adata, n_neighbors=n_neighbors, n_pcs=knn_n_pcs,
-                    method='rapids')
-    sc.tl.umap(adata, min_dist=umap_min_dist, spread=umap_spread,
-               method='rapids')
+    try:
+        sc.pp.neighbors(adata, n_neighbors=n_neighbors, n_pcs=knn_n_pcs,
+                        method='rapids')
+        sc.tl.umap(adata, min_dist=umap_min_dist, spread=umap_spread,
+                   method='rapids')
+    except Exception as err:
+        print(f"RAPIDS UMAP/neighbors failed ({type(err).__name__}: {err}). Fallback to CPU scanpy implementation.")
+        sc.pp.neighbors(adata, n_neighbors=n_neighbors, n_pcs=knn_n_pcs)
+        sc.tl.umap(adata, min_dist=umap_min_dist, spread=umap_spread)
     sc.tl.louvain(adata, flavor='igraph')
     print("UMAP louvain")
     sc.pl.umap(adata, color=["louvain"])
-    #adata.obs['leiden'] = rapids_scanpy_funcs.leiden(adata)
     sc.tl.leiden(adata, flavor='igraph')
     print("UMAP leiden")
     sc.pl.umap(adata, color=["leiden"])
