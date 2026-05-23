@@ -1,0 +1,33 @@
+{
+  "input": {
+    "adata_h5ad": "outputs/preprocess/standardized_matrix.h5ad",
+    "label_filter": null,
+    "add_markers": [
+      "BDNF"
+    ]
+  },
+  "output": {
+    "out_dir": "outputs/antipsychotic_pipeline",
+    "save_processed_h5ad": true,
+    "processed_h5ad_name": "adata_processed.h5ad"
+  },
+  "preprocess": {
+    "is_gpu": false
+  },
+  "drug_response": {
+    "drug_conc": 1000,
+    "selectivity_threshold": 1.5
+  },
+  "camp_pattern": {
+    "enabled": true,
+    "group_col": "is_clz_selective",
+    "selected_label": true,
+    "ki_inhibited": 0.01,
+    "ki_not_inhibited": 10000,
+    "pattern": {
+      "HTR1A_raw": true,
+      "CHRM2_raw": true,
+      "HRH3_raw": true
+    }
+  }
+}
