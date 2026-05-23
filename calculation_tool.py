@@ -1000,3 +1000,113 @@ def visualize_patterns(results_df_sorted, top_n=None, top_n_for_heatmap=None, sc
     
     plt.tight_layout()
     plt.show()
+
+import pandas as pd
+import numpy as np
+
+def compute_camp_response_for_pattern(
+    adata,
+    GPCR_adata_norm_df,
+    GPCR_type_df,
+    drug_conc,
+    pattern,
+    group_col="is_clz_selective",
+    selected_label=True,
+    Ki_inhibited=0.01,
+    Ki_not_inhibited=10000,
+):
+    """
+    特定のGPCR阻害パターンを指定したときの cAMP response を計算し、
+    - clz_selective / non_clz_selective の response
+    - Leiden クラスター情報
+    をまとめた DataFrame を返す。
+
+    pattern:
+        キー: 'HTR1A_raw' などの GPCR 列名
+        値: True (阻害) / False (非阻害)
+    """
+
+    # ---- 0. 形を揃える（位置ベースで合わせる）----
+    n_cells_expr = GPCR_adata_norm_df.shape[0]
+
+    # adata.obs のフラグを取り出して、長さだけ揃える（RangeIndex ベース）
+    if group_col not in adata.obs.columns:
+        raise ValueError(f"{group_col} が adata.obs にありません。")
+    group_values = adata.obs[group_col].values
+    if len(group_values) < n_cells_expr:
+        raise ValueError("GPCR_adata_norm_df の行数の方が adata.obs より多いです。対応するセル数が足りない。")
+    group_values = group_values[:n_cells_expr]
+    selective_mask = pd.Series(group_values == selected_label,
+                               index=pd.RangeIndex(n_cells_expr))
+
+    # Leiden クラスタも同様に取り出し（あれば）
+    if "leiden" in adata.obs.columns:
+        leiden_values = adata.obs["leiden"].astype(str).values
+        if len(leiden_values) < n_cells_expr:
+            raise ValueError("GPCR_adata_norm_df の行数の方が adata.obs より多いです（leiden列）。")
+        leiden_values = leiden_values[:n_cells_expr]
+    else:
+        leiden_values = np.array(["NA"] * n_cells_expr)
+
+    # ---- 1. GPCR 発現行列の準備 ----
+    GPCR_list2 = [col for col in GPCR_adata_norm_df.columns if col != "Unnamed: 0"]
+    all_expr = GPCR_adata_norm_df[GPCR_list2].copy()
+    # index を RangeIndex にしておく（元コードと同じノリ）
+    all_expr.index = pd.RangeIndex(n_cells_expr)
+
+    # ---- 2. Gs / Gi リスト作成 ----
+    Gs = GPCR_type_df[GPCR_type_df.type == "Gs"]["receptor_name"].values
+    Gi = GPCR_type_df[GPCR_type_df.type == "Gi"]["receptor_name"].values
+
+    Gs_filtered = [gene for gene in Gs if (gene + "_raw" in all_expr.columns)]
+    Gi_filtered = [gene for gene in Gi if (gene + "_raw" in all_expr.columns)]
+
+    Gs_cols = [gene + "_raw" for gene in Gs_filtered]
+    Gi_cols = [gene + "_raw" for gene in Gi_filtered]
+
+    # ---- 3. 1パターンで cAMP response を計算 ----
+    def simulate_response_all(expression_df, pattern, drug_conc, Gs_cols, Gi_cols):
+        # pattern に無いキーは阻害しない(False)
+        effective_Ki = pd.Series(
+            {
+                receptor: (Ki_inhibited if pattern.get(receptor, False) else Ki_not_inhibited)
+                for receptor in expression_df.columns
+            }
+        )
+
+        gs_effect = (expression_df[Gs_cols].divide(1 + drug_conc / effective_Ki[Gs_cols])).sum(axis=1)
+        gi_effect = (expression_df[Gi_cols].divide(1 + drug_conc / effective_Ki[Gi_cols])).sum(axis=1)
+        basal_cAMP = (expression_df[Gs_cols] - expression_df[Gi_cols]).sum(axis=1)
+
+        cAMPmod = (gs_effect - gi_effect) - basal_cAMP  # Series(index = cell)
+        return cAMPmod
+
+    all_responses = simulate_response_all(all_expr, pattern, drug_conc, Gs_cols, Gi_cols)
+
+    # ---- 4. plot 用 DataFrame ----
+    df_plot = pd.DataFrame(index=all_responses.index)
+    df_plot["cAMP_response"] = all_responses.values
+    df_plot["is_clz_selective"] = selective_mask.values
+    df_plot["leiden"] = leiden_values
+    df_plot["group"] = np.where(df_plot["is_clz_selective"],
+                                "clz_selective",
+                                "non_clz_selective")
+
+    # ---- 5. サマリー ----
+    selective_mean = df_plot.loc[df_plot["is_clz_selective"], "cAMP_response"].mean()
+    nonselective_mean = df_plot.loc[~df_plot["is_clz_selective"], "cAMP_response"].mean()
+    diff = selective_mean - nonselective_mean
+
+    summary = {
+        "selective_mean": selective_mean,
+        "nonselective_mean": nonselective_mean,
+        "diff": diff,
+        "n_clz_selective": int(df_plot["is_clz_selective"].sum()),
+        "n_nonselective": int((~df_plot["is_clz_selective"]).sum()),
+    }
+
+    print("n_clz_selective:", summary["n_clz_selective"])
+    print("n_nonselective:", summary["n_nonselective"])
+
+    return df_plot, summary
+
