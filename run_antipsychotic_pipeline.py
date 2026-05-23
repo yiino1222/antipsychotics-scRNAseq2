@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import pandas as pd
 import numpy as np
 from scipy.stats import mannwhitneyu, ttest_ind
-
-import calculation_tool as ct
-
 
 def compute_camp_response_for_pattern(
     adata,
@@ -47,6 +45,14 @@ def compute_camp_response_for_pattern(
 
 def run(config_path: Path):
     cfg = json.loads(config_path.read_text())
+    preprocess_cfg = cfg.get("preprocess", {})
+    gpu_device = preprocess_cfg.get("gpu_device")
+    if gpu_device is not None and str(gpu_device) != "":
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_device)
+        print(f"[env] CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
+
+    import calculation_tool as ct
+
     out_dir = Path(cfg["output"]["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 

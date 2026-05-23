@@ -33,6 +33,22 @@ python preprocess.py --config preprocess_config.json
 python run_antipsychotic_pipeline.py --config antipsychotic_pipeline_config.json
 ```
 
+### GPU を明示指定する
+
+`antipsychotic_pipeline_config.json` の `preprocess.gpu_device` を設定すると、
+実行時に `CUDA_VISIBLE_DEVICES` を自動設定します。
+
+例:
+
+```json
+"preprocess": {
+  "is_gpu": true,
+  "gpu_device": "1"
+}
+```
+
+※ `nvidia-smi` で空いている GPU 番号を選んでください。
+
 ## preprocess 設計ポイント
 
 - `file_type` は `h5ad`, `10x_mtx`, `10x_h5`, `csv` をサポート

@@ -12,7 +12,8 @@
     "processed_h5ad_name": "adata_processed.h5ad"
   },
   "preprocess": {
-    "is_gpu": false
+    "is_gpu": false,
+    "gpu_device": "1"
   },
   "drug_response": {
     "drug_conc": 1000,
