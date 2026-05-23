@@ -25,11 +25,16 @@ def pca(adata, n_components=50, train_ratio=0.35, n_batches=50, gpu=False):
     train_size = math.ceil(adata.X.shape[0] * train_ratio)
 
     if gpu:
-        from cuml.decomposition import PCA
+        from cuml.decomposition import PCA as CuPCA
+        from sklearn.decomposition import PCA as SkPCA
+        try:
+            pca = CuPCA(n_components=n_components).fit(adata.X[:train_size])
+        except Exception as err:
+            print(f"GPU PCA failed ({type(err).__name__}: {err}). Fallback to CPU sklearn PCA.")
+            pca = SkPCA(n_components=n_components).fit(adata.X[:train_size])
     else:
-        from sklearn.decomposition import PCA
-
-    pca = PCA(n_components=n_components).fit(adata.X[:train_size])
+        from sklearn.decomposition import PCA as SkPCA
+        pca = SkPCA(n_components=n_components).fit(adata.X[:train_size])
     
     embeddings = np.zeros((adata.X.shape[0], n_components))
     batch_size = int(embeddings.shape[0] / n_batches)
