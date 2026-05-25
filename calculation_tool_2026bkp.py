@@ -124,10 +124,6 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
         print(markers)
 
         raw_x = adata.X.tocsc() if scipy.sparse.issparse(adata.X) else np.asarray(adata.X)
-        if scipy.sparse.issparse(raw_x):
-            adata.layers["raw_counts"] = raw_x.copy().tocsr()
-        else:
-            adata.layers["raw_counts"] = np.asarray(raw_x).copy()
         marker_genes_raw = {}
         GPCR_df = pd.DataFrame(index=adata.obs_names)
         for marker in markers:
@@ -191,7 +187,6 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
                                                         max_genes=params['max_genes_per_cell'],barcodes=barcodes)
     sparse_gpu_array, genes = rapids_scanpy_funcs.filter_genes(sparse_gpu_array, genes, 
                                                             min_cells=params['min_cells_per_gene'])
-    raw_counts_snapshot = sparse_gpu_array.copy()
     """sparse_gpu_array, genes, marker_genes_raw = \
     rapids_scanpy_funcs.preprocess_in_batches(adata_path, 
                                               params['markers'], 
@@ -314,10 +309,6 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
     adata = anndata.AnnData(adata_matrix)
     adata.var_names = genes.to_pandas()
     adata.obs_names = filtered_barcodes.to_pandas()
-    try:
-        adata.layers["raw_counts"] = scipy.sparse.csr_matrix(raw_counts_snapshot.get())
-    except Exception:
-        adata.layers["raw_counts"] = raw_counts_snapshot.get()
     print(f"shape of adata: {adata.X.shape}")
     
     # Restore labels after preprocessing
@@ -327,7 +318,7 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
         filtered_labels = original_labels.loc[filtered_barcodes_host].values
         adata.obs["label"] = filtered_labels
     
-    del sparse_gpu_array, genes, raw_counts_snapshot
+    del sparse_gpu_array, genes
     gc.collect()
     cp.get_default_memory_pool().free_all_blocks()
     print(f"shape of adata: {adata.X.shape}")
