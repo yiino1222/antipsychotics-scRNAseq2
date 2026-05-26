@@ -109,7 +109,11 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
         adata.var_names = pd.Index([str(v).upper() for v in adata.var_names])
         adata.var_names_make_unique()
         sc.pp.filter_cells(adata, min_genes=params['min_genes_per_cell'])
-        adata = adata[adata.obs["n_genes"] <= params['max_genes_per_cell']].copy()
+        n_genes_col = "n_genes" if "n_genes" in adata.obs.columns else "n_genes_by_counts"
+        if n_genes_col not in adata.obs.columns:
+            sc.pp.calculate_qc_metrics(adata, inplace=True)
+            n_genes_col = "n_genes_by_counts" if "n_genes_by_counts" in adata.obs.columns else "n_genes"
+        adata = adata[adata.obs[n_genes_col] <= params['max_genes_per_cell']].copy()
         sc.pp.filter_genes(adata, min_cells=params['min_cells_per_gene'])
 
         markers=params['markers'].copy()
@@ -140,7 +144,12 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
 
         sc.pp.normalize_total(adata, target_sum=1e4)
         sc.pp.log1p(adata)
-        sc.pp.regress_out(adata, keys=['total_counts'])
+        if "total_counts" not in adata.obs.columns:
+            sc.pp.calculate_qc_metrics(adata, inplace=True)
+        if "total_counts" in adata.obs.columns:
+            sc.pp.regress_out(adata, keys=['total_counts'])
+        else:
+            print("[WARN] total_counts is unavailable. Skip regress_out in CPU path.")
         sc.pp.scale(adata, max_value=10)
         print(adata.X.dtype)
         preprocess_time = time.time()
