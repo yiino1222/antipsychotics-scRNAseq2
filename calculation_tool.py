@@ -144,6 +144,10 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
 
         sc.pp.normalize_total(adata, target_sum=1e4)
         sc.pp.log1p(adata)
+        if scipy.sparse.issparse(adata.X):
+            adata.layers["lognorm"] = adata.X.copy().tocsr()
+        else:
+            adata.layers["lognorm"] = np.asarray(adata.X).copy()
         if "total_counts" not in adata.obs.columns:
             sc.pp.calculate_qc_metrics(adata, inplace=True)
         if "total_counts" in adata.obs.columns:
@@ -323,10 +327,18 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
     adata = anndata.AnnData(adata_matrix)
     adata.var_names = genes.to_pandas()
     adata.obs_names = filtered_barcodes.to_pandas()
+    raw_counts_host = raw_counts_snapshot.get()
     try:
-        adata.layers["raw_counts"] = scipy.sparse.csr_matrix(raw_counts_snapshot.get())
+        adata.layers["raw_counts"] = scipy.sparse.csr_matrix(raw_counts_host)
     except Exception:
-        adata.layers["raw_counts"] = raw_counts_snapshot.get()
+        adata.layers["raw_counts"] = raw_counts_host
+    lognorm_src = anndata.AnnData(adata.layers["raw_counts"].copy())
+    sc.pp.normalize_total(lognorm_src, target_sum=1e4)
+    sc.pp.log1p(lognorm_src)
+    if scipy.sparse.issparse(lognorm_src.X):
+        adata.layers["lognorm"] = lognorm_src.X.copy().tocsr()
+    else:
+        adata.layers["lognorm"] = np.asarray(lognorm_src.X).copy()
     print(f"shape of adata: {adata.X.shape}")
     
     # Restore labels after preprocessing
