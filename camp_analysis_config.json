@@ -1,0 +1,26 @@
+{
+  "input": {
+    "adata_h5ad": "cache/human_pfc_input.h5ad",
+    "gpcr_norm_csv": "cache/GPCR_adata_norm_df.csv",
+    "gpcr_type_csv": "data/GPCR_df.csv"
+  },
+  "output": {
+    "out_dir": "outputs/camp_analysis"
+  },
+  "analysis": {
+    "drug_conc": 1000,
+    "group_col": "is_clz_selective",
+    "selected_label": true,
+    "pattern": {
+      "HTR1A_raw": true,
+      "CHRM2_raw": true,
+      "HRH3_raw": true
+    },
+    "ki_inhibited": 0.01,
+    "ki_not_inhibited": 10000
+  },
+  "plot": {
+    "cluster_col": "leiden",
+    "make_cluster_plot": true
+  }
+}
