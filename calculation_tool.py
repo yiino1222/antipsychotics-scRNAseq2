@@ -613,15 +613,15 @@ def calc_drug_response(adata,GPCR_df,GPCR_type_df,drug_list,D_R_mtx,drug_conc):
         Gs_effect=(norm_df.loc[:,Gs]/(1+drug_conc/D_R_mtx.loc[drug,Gs])).sum(axis=1) #TODO ki値で割り算するときにlog換算すべきか
         Gi_effect=(norm_df.loc[:,Gi]/(1+drug_conc/D_R_mtx.loc[drug,Gi])).sum(axis=1)
         basal_cAMP=(norm_df.loc[:,Gs]-norm_df.loc[:,Gi]).sum(axis=1)
-        #Gq_effect=(norm_df.loc[:,Gq]/D_R_mtx.loc[drug,Gq]).sum(axis=1)
+        Gq_effect=(norm_df.loc[:,Gq]/D_R_mtx.loc[drug,Gq]).sum(axis=1)
         cAMPmod=(Gs_effect-Gi_effect)-basal_cAMP #Giの阻害→cAMP上昇、Gsの阻害→cAMP低下
         cAMP_df[drug]=cAMPmod
     cAMP_df.index=adata.obs_names
-    #Ca_df.index=adata.obs_names
-    #Ca_df=Ca_df+10**(-4)
+    Ca_df.index=adata.obs_names
+    Ca_df=Ca_df+10**(-4)
     for drug in drug_list:
         adata.obs['cAMP_%s'%drug]=cAMP_df[drug]
-        #adata.obs['Ca_%s'%drug]=Ca_df[drug]
+        adata.obs['Ca_%s'%drug]=Ca_df[drug]
         
     return adata
 
