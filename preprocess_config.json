@@ -1,0 +1,15 @@
+{
+  "datasets": [
+    {
+      "name": "human_pfc_example",
+      "path": "cache/human_pfc_input.h5ad",
+      "file_type": "h5ad",
+      "species": "human",
+      "region": "PFC"
+    }
+  ],
+  "output": {
+    "out_dir": "outputs/preprocess",
+    "matrix_name": "standardized_matrix.h5ad"
+  }
+}

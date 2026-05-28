@@ -87,9 +87,6 @@ def set_parameters_for_preprocess(GPCR_list):
     return params
 
 def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True):
-    import cudf
-    import cupy as cp
-    import rapids_scanpy_funcs
     preprocess_start = time.time()
     D_R_mtx,GPCR_type_df,drug_list,GPCR_list=load_parameters()
     # Set parameters
@@ -107,6 +104,95 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
     adata = anndata.read_h5ad(adata_path)
     if label !=None:
         adata=adata[adata.obs["label"]==label]
+    if not is_gpu:
+        print("is_gpu=False: run full CPU preprocessing path (no cuDF/CuPy).")
+        adata.var_names = pd.Index([str(v).upper() for v in adata.var_names])
+        adata.var_names_make_unique()
+        sc.pp.filter_cells(adata, min_genes=params['min_genes_per_cell'])
+        n_genes_col = "n_genes" if "n_genes" in adata.obs.columns else "n_genes_by_counts"
+        if n_genes_col not in adata.obs.columns:
+            sc.pp.calculate_qc_metrics(adata, inplace=True)
+            n_genes_col = "n_genes_by_counts" if "n_genes_by_counts" in adata.obs.columns else "n_genes"
+        adata = adata[adata.obs[n_genes_col] <= params['max_genes_per_cell']].copy()
+        sc.pp.filter_genes(adata, min_cells=params['min_cells_per_gene'])
+
+        markers=params['markers'].copy()
+        markers_to_remove = set()
+        for marker in markers:
+            if marker not in adata.var_names:
+                print(f"{marker} is not included")
+                markers_to_remove.add(marker)
+                print(f"{marker} is removed from marker list")
+        for marker in markers_to_remove:
+            markers.remove(marker)
+        print(markers)
+
+        raw_x = adata.X.tocsc() if scipy.sparse.issparse(adata.X) else np.asarray(adata.X)
+        if scipy.sparse.issparse(raw_x):
+            adata.layers["raw_counts"] = raw_x.copy().tocsr()
+        else:
+            adata.layers["raw_counts"] = np.asarray(raw_x).copy()
+        marker_genes_raw = {}
+        GPCR_df = pd.DataFrame(index=adata.obs_names)
+        for marker in markers:
+            idx = adata.var_names.get_loc(marker)
+            vals = raw_x[:, idx].toarray().ravel() if scipy.sparse.issparse(raw_x) else raw_x[:, idx].ravel()
+            marker_genes_raw[f"{marker}_raw"] = vals
+            if marker in GPCR_list:
+                GPCR_df[f"{marker}_raw"] = vals
+            adata.obs[f"{marker}_raw"] = vals
+
+        sc.pp.normalize_total(adata, target_sum=1e4)
+        sc.pp.log1p(adata)
+        if scipy.sparse.issparse(adata.X):
+            adata.layers["lognorm"] = adata.X.copy().tocsr()
+        else:
+            adata.layers["lognorm"] = np.asarray(adata.X).copy()
+        if "total_counts" not in adata.obs.columns:
+            sc.pp.calculate_qc_metrics(adata, inplace=True)
+        if "total_counts" in adata.obs.columns:
+            sc.pp.regress_out(adata, keys=['total_counts'])
+        else:
+            print("[WARN] total_counts is unavailable. Skip regress_out in CPU path.")
+        sc.pp.scale(adata, max_value=10)
+        # HVG annotation only (do not subset genes)
+        sc.pp.highly_variable_genes(
+            adata,
+            n_top_genes=params["n_top_genes"],
+            subset=False
+        )
+        print(adata.X.dtype)
+        preprocess_time = time.time()
+        print("Total Preprocessing time: %s" % (preprocess_time-preprocess_start))
+        print(f"shape of adata: {adata.X.shape}")
+
+        print("perform PCA")
+        print(params["n_pca_batches"])
+        adata = utils.pca(adata, n_components=params["n_components"],
+                          train_ratio=params["pca_train_ratio"],
+                          n_batches=params["n_pca_batches"],
+                          gpu=False)
+        print("UMAP")
+        sc.pp.neighbors(adata, n_neighbors=params["n_neighbors"], n_pcs=params["knn_n_pcs"])
+        sc.tl.umap(adata, min_dist=params["umap_min_dist"], spread=params["umap_spread"])
+        sc.tl.louvain(adata)
+        sc.tl.leiden(adata)
+
+        print("calc drug response")
+        default_drug_conc=100
+        adata=calc_drug_response(adata,GPCR_df,GPCR_type_df,drug_list,D_R_mtx,default_drug_conc)
+
+        selectivity_threshold=1.2
+        adata,num_clz_selective_cells=calc_clz_selective_cell(adata,drug_list,selectivity_threshold)
+
+        file_root, file_extension = os.path.splitext(adata_path)
+        processed_file_path = f"{file_root}_processed{file_extension}"
+        adata.write(processed_file_path)
+        return adata,GPCR_df
+
+    import cudf
+    import cupy as cp
+    import rapids_scanpy_funcs
     genes = cudf.Series(adata.var_names).str.upper()
     barcodes = cudf.Series(adata.obs_names)
     is_label=False
@@ -124,6 +210,7 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
                                                         max_genes=params['max_genes_per_cell'],barcodes=barcodes)
     sparse_gpu_array, genes = rapids_scanpy_funcs.filter_genes(sparse_gpu_array, genes, 
                                                             min_cells=params['min_cells_per_gene'])
+    raw_counts_snapshot = sparse_gpu_array.copy()
     """sparse_gpu_array, genes, marker_genes_raw = \
     rapids_scanpy_funcs.preprocess_in_batches(adata_path, 
                                               params['markers'], 
@@ -246,6 +333,18 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
     adata = anndata.AnnData(adata_matrix)
     adata.var_names = genes.to_pandas()
     adata.obs_names = filtered_barcodes.to_pandas()
+    raw_counts_host = raw_counts_snapshot.get()
+    try:
+        adata.layers["raw_counts"] = scipy.sparse.csr_matrix(raw_counts_host)
+    except Exception:
+        adata.layers["raw_counts"] = raw_counts_host
+    lognorm_src = anndata.AnnData(adata.layers["raw_counts"].copy())
+    sc.pp.normalize_total(lognorm_src, target_sum=1e4)
+    sc.pp.log1p(lognorm_src)
+    if scipy.sparse.issparse(lognorm_src.X):
+        adata.layers["lognorm"] = lognorm_src.X.copy().tocsr()
+    else:
+        adata.layers["lognorm"] = np.asarray(lognorm_src.X).copy()
     print(f"shape of adata: {adata.X.shape}")
     
     # Restore labels after preprocessing
@@ -255,7 +354,7 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
         filtered_labels = original_labels.loc[filtered_barcodes_host].values
         adata.obs["label"] = filtered_labels
     
-    del sparse_gpu_array, genes
+    del sparse_gpu_array, genes, raw_counts_snapshot
     gc.collect()
     cp.get_default_memory_pool().free_all_blocks()
     print(f"shape of adata: {adata.X.shape}")
@@ -265,6 +364,13 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
         adata.obs[name] = data.get()
         if   name[:-4] in GPCR_list:
             GPCR_df[name]=data.get()
+
+    # HVG annotation only (do not subset genes)
+    sc.pp.highly_variable_genes(
+        adata,
+        n_top_genes=params["n_top_genes"],
+        subset=False
+    )
         
     # Deminsionality reduction
     #We use PCA to reduce the dimensionality of the matrix to its top 50 principal components.
