@@ -155,12 +155,14 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
         else:
             print("[WARN] total_counts is unavailable. Skip regress_out in CPU path.")
         sc.pp.scale(adata, max_value=10)
+
         # HVG annotation only (do not subset genes)
         sc.pp.highly_variable_genes(
             adata,
             n_top_genes=params["n_top_genes"],
             subset=False
         )
+
         print(adata.X.dtype)
         preprocess_time = time.time()
         print("Total Preprocessing time: %s" % (preprocess_time-preprocess_start))
@@ -623,60 +625,18 @@ def calc_drug_response(adata,GPCR_df,GPCR_type_df,drug_list,D_R_mtx,drug_conc):
     cAMP_df=pd.DataFrame(columns=drug_list)
     Ca_df=pd.DataFrame(columns=drug_list)
     for drug in drug_list:
-
-        # =========================
-        # Gs / Gi → cAMP effect
-        # =========================
-        Gs_Ki = D_R_mtx.loc[drug, Gs].replace(0, np.nan)
-        Gi_Ki = D_R_mtx.loc[drug, Gi].replace(0, np.nan)
-
-        Gs_effect = (
-            norm_df.loc[:, Gs]
-            .div(1 + drug_conc / Gs_Ki, axis=1)
-            .sum(axis=1)
-        )
-
-        Gi_effect = (
-            norm_df.loc[:, Gi]
-            .div(1 + drug_conc / Gi_Ki, axis=1)
-            .sum(axis=1)
-        )
-
-        basal_cAMP = (
-            norm_df.loc[:, Gs].sum(axis=1)
-            - norm_df.loc[:, Gi].sum(axis=1)
-        )
-
-        cAMP_mod = (Gs_effect - Gi_effect) - basal_cAMP
-        # Gi阻害 → cAMP上昇
-        # Gs阻害 → cAMP低下
-
-        cAMP_df[drug] = cAMP_mod
-
-        # =========================
-        # Gq → Ca effect
-        # =========================
-        Gq_Ki = D_R_mtx.loc[drug, Gq].replace(0, np.nan)
-
-        Gq_effect = (
-            norm_df.loc[:, Gq]
-            .div(1 + drug_conc / Gq_Ki, axis=1)
-            .sum(axis=1)
-        )
-
-        basal_Ca = norm_df.loc[:, Gq].sum(axis=1)
-
-        Ca_mod = Gq_effect - basal_Ca
-        # Gq阻害 → Ca低下なので負の値になる
-
-        Ca_df[drug] = Ca_mod
-
-    # 念のためNaN処理
-    cAMP_df = cAMP_df.fillna(0)
-    Ca_df = Ca_df.fillna(0)
+        Gs_effect=(norm_df.loc[:,Gs]/(1+drug_conc/D_R_mtx.loc[drug,Gs])).sum(axis=1) #TODO ki値で割り算するときにlog換算すべきか
+        Gi_effect=(norm_df.loc[:,Gi]/(1+drug_conc/D_R_mtx.loc[drug,Gi])).sum(axis=1)
+        basal_cAMP=(norm_df.loc[:,Gs]-norm_df.loc[:,Gi]).sum(axis=1)
+        basal_Ca=(norm_df.loc[:,Gq]).sum(axis=1)
+        Gq_effect=(norm_df.loc[:,Gq]/D_R_mtx.loc[drug,Gq]).sum(axis=1)
+        cAMPmod=(Gs_effect-Gi_effect)-basal_cAMP #Giの阻害→cAMP上昇、Gsの阻害→cAMP低下
+        cAMP_df[drug]=cAMPmod
+        Camod=Gq_effect-basal_Ca
+        Ca_df[drug]=Camod
+    cAMP_df.index=adata.obs_names
+    Ca_df.index=adata.obs_names
     Ca_df=Ca_df+10**(-4)
-    cAMP_df=cAMP_df+10**(-4)
-
     for drug in drug_list:
         adata.obs['cAMP_%s'%drug]=cAMP_df[drug]
         adata.obs['Ca_%s'%drug]=Ca_df[drug]
@@ -711,16 +671,13 @@ def calc_clz_selective_cell(adata,drug_list,selectivity_threshold):
     adata.obs["cAMP_clz_selectivity"] = (adata.obs["cAMP_CLOZAPINE"] ** 2) / (adata.obs["cAMP_mean_other_than_czp"] ** 2)
 
     # selectivity_threshold と cAMP_CLOZAPINE > 0 の条件を満たす細胞をカテゴリ型でラベル付け
-    is_clz_selective = (
-        (adata.obs["cAMP_clz_selectivity"] > selectivity_threshold)
-        & (adata.obs["cAMP_CLOZAPINE"] > 0)
-    ).astype(bool)
-    adata.obs["is_clz_selective"] = pd.Categorical(is_clz_selective, categories=[False, True])
-
+    adata.obs["is_clz_selective"] = (((adata.obs["cAMP_clz_selectivity"] > selectivity_threshold) & 
+                                    (adata.obs["cAMP_CLOZAPINE"] > 0))
+                                    ).astype("category")
+    
     print("clz selective cells")
-    clz_selective_counts = adata.obs["is_clz_selective"].value_counts().reindex([False, True], fill_value=0)
-    print("# of clz selective cells:", clz_selective_counts)
-    num_clz_selective = int(clz_selective_counts.loc[True])
+    print("# of clz selective cells:",adata.obs["is_clz_selective"].value_counts())
+    num_clz_selective = adata.obs["is_clz_selective"].value_counts()[True]
     sc.pl.umap(adata, color=["is_clz_selective"],palette=["gray", "red"])
     return adata,num_clz_selective
 
