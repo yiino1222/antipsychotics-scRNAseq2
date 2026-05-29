@@ -109,11 +109,7 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
         adata.var_names = pd.Index([str(v).upper() for v in adata.var_names])
         adata.var_names_make_unique()
         sc.pp.filter_cells(adata, min_genes=params['min_genes_per_cell'])
-        n_genes_col = "n_genes" if "n_genes" in adata.obs.columns else "n_genes_by_counts"
-        if n_genes_col not in adata.obs.columns:
-            sc.pp.calculate_qc_metrics(adata, inplace=True)
-            n_genes_col = "n_genes_by_counts" if "n_genes_by_counts" in adata.obs.columns else "n_genes"
-        adata = adata[adata.obs[n_genes_col] <= params['max_genes_per_cell']].copy()
+        adata = adata[adata.obs["n_genes"] <= params['max_genes_per_cell']].copy()
         sc.pp.filter_genes(adata, min_cells=params['min_cells_per_gene'])
 
         markers=params['markers'].copy()
@@ -128,10 +124,6 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
         print(markers)
 
         raw_x = adata.X.tocsc() if scipy.sparse.issparse(adata.X) else np.asarray(adata.X)
-        if scipy.sparse.issparse(raw_x):
-            adata.layers["raw_counts"] = raw_x.copy().tocsr()
-        else:
-            adata.layers["raw_counts"] = np.asarray(raw_x).copy()
         marker_genes_raw = {}
         GPCR_df = pd.DataFrame(index=adata.obs_names)
         for marker in markers:
@@ -144,23 +136,8 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
 
         sc.pp.normalize_total(adata, target_sum=1e4)
         sc.pp.log1p(adata)
-        if scipy.sparse.issparse(adata.X):
-            adata.layers["lognorm"] = adata.X.copy().tocsr()
-        else:
-            adata.layers["lognorm"] = np.asarray(adata.X).copy()
-        if "total_counts" not in adata.obs.columns:
-            sc.pp.calculate_qc_metrics(adata, inplace=True)
-        if "total_counts" in adata.obs.columns:
-            sc.pp.regress_out(adata, keys=['total_counts'])
-        else:
-            print("[WARN] total_counts is unavailable. Skip regress_out in CPU path.")
+        sc.pp.regress_out(adata, keys=['total_counts'])
         sc.pp.scale(adata, max_value=10)
-        # HVG annotation only (do not subset genes)
-        sc.pp.highly_variable_genes(
-            adata,
-            n_top_genes=params["n_top_genes"],
-            subset=False
-        )
         print(adata.X.dtype)
         preprocess_time = time.time()
         print("Total Preprocessing time: %s" % (preprocess_time-preprocess_start))
@@ -210,7 +187,6 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
                                                         max_genes=params['max_genes_per_cell'],barcodes=barcodes)
     sparse_gpu_array, genes = rapids_scanpy_funcs.filter_genes(sparse_gpu_array, genes, 
                                                             min_cells=params['min_cells_per_gene'])
-    raw_counts_snapshot = sparse_gpu_array.copy()
     """sparse_gpu_array, genes, marker_genes_raw = \
     rapids_scanpy_funcs.preprocess_in_batches(adata_path, 
                                               params['markers'], 
@@ -333,18 +309,6 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
     adata = anndata.AnnData(adata_matrix)
     adata.var_names = genes.to_pandas()
     adata.obs_names = filtered_barcodes.to_pandas()
-    raw_counts_host = raw_counts_snapshot.get()
-    try:
-        adata.layers["raw_counts"] = scipy.sparse.csr_matrix(raw_counts_host)
-    except Exception:
-        adata.layers["raw_counts"] = raw_counts_host
-    lognorm_src = anndata.AnnData(adata.layers["raw_counts"].copy())
-    sc.pp.normalize_total(lognorm_src, target_sum=1e4)
-    sc.pp.log1p(lognorm_src)
-    if scipy.sparse.issparse(lognorm_src.X):
-        adata.layers["lognorm"] = lognorm_src.X.copy().tocsr()
-    else:
-        adata.layers["lognorm"] = np.asarray(lognorm_src.X).copy()
     print(f"shape of adata: {adata.X.shape}")
     
     # Restore labels after preprocessing
@@ -354,7 +318,7 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
         filtered_labels = original_labels.loc[filtered_barcodes_host].values
         adata.obs["label"] = filtered_labels
     
-    del sparse_gpu_array, genes, raw_counts_snapshot
+    del sparse_gpu_array, genes
     gc.collect()
     cp.get_default_memory_pool().free_all_blocks()
     print(f"shape of adata: {adata.X.shape}")
@@ -364,13 +328,6 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
         adata.obs[name] = data.get()
         if   name[:-4] in GPCR_list:
             GPCR_df[name]=data.get()
-
-    # HVG annotation only (do not subset genes)
-    sc.pp.highly_variable_genes(
-        adata,
-        n_top_genes=params["n_top_genes"],
-        subset=False
-    )
         
     # Deminsionality reduction
     #We use PCA to reduce the dimensionality of the matrix to its top 50 principal components.
@@ -618,68 +575,23 @@ def calc_drug_response(adata,GPCR_df,GPCR_type_df,drug_list,D_R_mtx,drug_conc):
     
     Gs=GPCR_type_df[GPCR_type_df.type=="Gs"]["receptor_name"].values
     Gi=GPCR_type_df[GPCR_type_df.type=="Gi"]["receptor_name"].values
-    Gq=GPCR_type_df[GPCR_type_df.type=="Gq"]["receptor_name"].values
+    #Gq=GPCR_type_df[GPCR_type_df.type=="Gq"]["receptor_name"].values
     
     cAMP_df=pd.DataFrame(columns=drug_list)
-    Ca_df=pd.DataFrame(columns=drug_list)
+    #Ca_df=pd.DataFrame(columns=drug_list)
     for drug in drug_list:
-
-        # =========================
-        # Gs / Gi → cAMP effect
-        # =========================
-        Gs_Ki = D_R_mtx.loc[drug, Gs].replace(0, np.nan)
-        Gi_Ki = D_R_mtx.loc[drug, Gi].replace(0, np.nan)
-
-        Gs_effect = (
-            norm_df.loc[:, Gs]
-            .div(1 + drug_conc / Gs_Ki, axis=1)
-            .sum(axis=1)
-        )
-
-        Gi_effect = (
-            norm_df.loc[:, Gi]
-            .div(1 + drug_conc / Gi_Ki, axis=1)
-            .sum(axis=1)
-        )
-
-        basal_cAMP = (
-            norm_df.loc[:, Gs].sum(axis=1)
-            - norm_df.loc[:, Gi].sum(axis=1)
-        )
-
-        cAMP_mod = (Gs_effect - Gi_effect) - basal_cAMP
-        # Gi阻害 → cAMP上昇
-        # Gs阻害 → cAMP低下
-
-        cAMP_df[drug] = cAMP_mod
-
-        # =========================
-        # Gq → Ca effect
-        # =========================
-        Gq_Ki = D_R_mtx.loc[drug, Gq].replace(0, np.nan)
-
-        Gq_effect = (
-            norm_df.loc[:, Gq]
-            .div(1 + drug_conc / Gq_Ki, axis=1)
-            .sum(axis=1)
-        )
-
-        basal_Ca = norm_df.loc[:, Gq].sum(axis=1)
-
-        Ca_mod = Gq_effect - basal_Ca
-        # Gq阻害 → Ca低下なので負の値になる
-
-        Ca_df[drug] = Ca_mod
-
-    # 念のためNaN処理
-    cAMP_df = cAMP_df.fillna(0)
-    Ca_df = Ca_df.fillna(0)
-    Ca_df=Ca_df+10**(-4)
-    cAMP_df=cAMP_df+10**(-4)
-
+        Gs_effect=(norm_df.loc[:,Gs]/(1+drug_conc/D_R_mtx.loc[drug,Gs])).sum(axis=1) #TODO ki値で割り算するときにlog換算すべきか
+        Gi_effect=(norm_df.loc[:,Gi]/(1+drug_conc/D_R_mtx.loc[drug,Gi])).sum(axis=1)
+        basal_cAMP=(norm_df.loc[:,Gs]-norm_df.loc[:,Gi]).sum(axis=1)
+        #Gq_effect=(norm_df.loc[:,Gq]/D_R_mtx.loc[drug,Gq]).sum(axis=1)
+        cAMPmod=(Gs_effect-Gi_effect)-basal_cAMP #Giの阻害→cAMP上昇、Gsの阻害→cAMP低下
+        cAMP_df[drug]=cAMPmod
+    cAMP_df.index=adata.obs_names
+    #Ca_df.index=adata.obs_names
+    #Ca_df=Ca_df+10**(-4)
     for drug in drug_list:
         adata.obs['cAMP_%s'%drug]=cAMP_df[drug]
-        adata.obs['Ca_%s'%drug]=Ca_df[drug]
+        #adata.obs['Ca_%s'%drug]=Ca_df[drug]
         
     return adata
 
@@ -711,16 +623,13 @@ def calc_clz_selective_cell(adata,drug_list,selectivity_threshold):
     adata.obs["cAMP_clz_selectivity"] = (adata.obs["cAMP_CLOZAPINE"] ** 2) / (adata.obs["cAMP_mean_other_than_czp"] ** 2)
 
     # selectivity_threshold と cAMP_CLOZAPINE > 0 の条件を満たす細胞をカテゴリ型でラベル付け
-    is_clz_selective = (
-        (adata.obs["cAMP_clz_selectivity"] > selectivity_threshold)
-        & (adata.obs["cAMP_CLOZAPINE"] > 0)
-    ).astype(bool)
-    adata.obs["is_clz_selective"] = pd.Categorical(is_clz_selective, categories=[False, True])
-
+    adata.obs["is_clz_selective"] = (((adata.obs["cAMP_clz_selectivity"] > selectivity_threshold) & 
+                                    (adata.obs["cAMP_CLOZAPINE"] > 0))
+                                    ).astype("category")
+    
     print("clz selective cells")
-    clz_selective_counts = adata.obs["is_clz_selective"].value_counts().reindex([False, True], fill_value=0)
-    print("# of clz selective cells:", clz_selective_counts)
-    num_clz_selective = int(clz_selective_counts.loc[True])
+    print("# of clz selective cells:",adata.obs["is_clz_selective"].value_counts())
+    num_clz_selective = adata.obs["is_clz_selective"].value_counts()[True]
     sc.pl.umap(adata, color=["is_clz_selective"],palette=["gray", "red"])
     return adata,num_clz_selective
 
