@@ -620,20 +620,65 @@ def calc_drug_response(adata,GPCR_df,GPCR_type_df,drug_list,D_R_mtx,drug_conc):
     
     Gs=GPCR_type_df[GPCR_type_df.type=="Gs"]["receptor_name"].values
     Gi=GPCR_type_df[GPCR_type_df.type=="Gi"]["receptor_name"].values
-    #Gq=GPCR_type_df[GPCR_type_df.type=="Gq"]["receptor_name"].values
+    Gq=GPCR_type_df[GPCR_type_df.type=="Gq"]["receptor_name"].values
     
     cAMP_df=pd.DataFrame(columns=drug_list)
-    #Ca_df=pd.DataFrame(columns=drug_list)
+    Ca_df=pd.DataFrame(columns=drug_list)
     for drug in drug_list:
-        Gs_effect=(norm_df.loc[:,Gs]/(1+drug_conc/D_R_mtx.loc[drug,Gs])).sum(axis=1) #TODO ki値で割り算するときにlog換算すべきか
-        Gi_effect=(norm_df.loc[:,Gi]/(1+drug_conc/D_R_mtx.loc[drug,Gi])).sum(axis=1)
-        basal_cAMP=(norm_df.loc[:,Gs]-norm_df.loc[:,Gi]).sum(axis=1)
-        Gq_effect=(norm_df.loc[:,Gq]/D_R_mtx.loc[drug,Gq]).sum(axis=1)
-        cAMPmod=(Gs_effect-Gi_effect)-basal_cAMP #Giの阻害→cAMP上昇、Gsの阻害→cAMP低下
-        cAMP_df[drug]=cAMPmod
-    cAMP_df.index=adata.obs_names
-    Ca_df.index=adata.obs_names
+
+        # =========================
+        # Gs / Gi → cAMP effect
+        # =========================
+        Gs_Ki = D_R_mtx.loc[drug, Gs].replace(0, np.nan)
+        Gi_Ki = D_R_mtx.loc[drug, Gi].replace(0, np.nan)
+
+        Gs_effect = (
+            norm_df.loc[:, Gs]
+            .div(1 + drug_conc / Gs_Ki, axis=1)
+            .sum(axis=1)
+        )
+
+        Gi_effect = (
+            norm_df.loc[:, Gi]
+            .div(1 + drug_conc / Gi_Ki, axis=1)
+            .sum(axis=1)
+        )
+
+        basal_cAMP = (
+            norm_df.loc[:, Gs].sum(axis=1)
+            - norm_df.loc[:, Gi].sum(axis=1)
+        )
+
+        cAMP_mod = (Gs_effect - Gi_effect) - basal_cAMP
+        # Gi阻害 → cAMP上昇
+        # Gs阻害 → cAMP低下
+
+        cAMP_df[drug] = cAMP_mod
+
+        # =========================
+        # Gq → Ca effect
+        # =========================
+        Gq_Ki = D_R_mtx.loc[drug, Gq].replace(0, np.nan)
+
+        Gq_effect = (
+            norm_df.loc[:, Gq]
+            .div(1 + drug_conc / Gq_Ki, axis=1)
+            .sum(axis=1)
+        )
+
+        basal_Ca = norm_df.loc[:, Gq].sum(axis=1)
+
+        Ca_mod = Gq_effect - basal_Ca
+        # Gq阻害 → Ca低下なので負の値になる
+
+        Ca_df[drug] = Ca_mod
+
+    # 念のためNaN処理
+    cAMP_df = cAMP_df.fillna(0)
+    Ca_df = Ca_df.fillna(0)
     Ca_df=Ca_df+10**(-4)
+    cAMP_df=cAMP_df+10**(-4)
+
     for drug in drug_list:
         adata.obs['cAMP_%s'%drug]=cAMP_df[drug]
         adata.obs['Ca_%s'%drug]=Ca_df[drug]
