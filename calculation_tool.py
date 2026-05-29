@@ -155,15 +155,14 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
         else:
             print("[WARN] total_counts is unavailable. Skip regress_out in CPU path.")
         sc.pp.scale(adata, max_value=10)
-<<<<<<< codex/add-camp-response-comparison-and-visualization-4nz06m
+
         # HVG annotation only (do not subset genes)
         sc.pp.highly_variable_genes(
             adata,
             n_top_genes=params["n_top_genes"],
             subset=False
         )
-=======
->>>>>>> main
+
         print(adata.X.dtype)
         preprocess_time = time.time()
         print("Total Preprocessing time: %s" % (preprocess_time-preprocess_start))
