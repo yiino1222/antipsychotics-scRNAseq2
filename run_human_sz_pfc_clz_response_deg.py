@@ -289,6 +289,18 @@ def make_pseudobulk_tables(
     pseudobulk_counts.to_csv(output_dir / "clz_responsive_cells_pseudobulk_counts_by_donor.csv")
     pseudobulk_log_cpm.to_csv(output_dir / "clz_responsive_cells_pseudobulk_logCPM_by_donor.csv")
     pseudobulk_metadata.to_csv(output_dir / "clz_responsive_cells_pseudobulk_metadata.csv")
+    pseudobulk_counts.round().astype(int).T.to_csv(
+        output_dir / "clz_responsive_cells_pseudobulk_counts_for_deseq2_edger.csv"
+    )
+    pseudobulk_metadata.to_csv(output_dir / "clz_responsive_cells_pseudobulk_coldata_for_deseq2_edger.csv")
+    (output_dir / "clz_responsive_cells_pseudobulk_deseq2_edger_notes.txt").write_text(
+        "Counts file: clz_responsive_cells_pseudobulk_counts_for_deseq2_edger.csv\n"
+        "  - rows are genes, columns are donor-level pseudobulk samples.\n"
+        "Metadata file: clz_responsive_cells_pseudobulk_coldata_for_deseq2_edger.csv\n"
+        "  - rows are donor-level pseudobulk samples.\n"
+        "Suggested design for edgeR/DESeq2: ~ diagnosis_group\n",
+        encoding="utf-8",
+    )
     return pseudobulk_counts, pseudobulk_log_cpm, pseudobulk_metadata
 
 
@@ -297,6 +309,8 @@ def run_pseudobulk_deg(
     pseudobulk_log_cpm: pd.DataFrame,
     pseudobulk_metadata: pd.DataFrame,
     output_dir: Path,
+    min_cpm: float,
+    min_samples: int,
 ) -> pd.DataFrame:
     """Run donor-level Welch t-tests on pseudobulked clozapine-responsive cells."""
     sz_samples = pseudobulk_metadata.index[pseudobulk_metadata["diagnosis_group"].astype(str) == "Sz"]
@@ -307,8 +321,24 @@ def run_pseudobulk_deg(
             f"(observed Sz={len(sz_samples)}, healthy_control={len(control_samples)})."
         )
 
+    pseudobulk_cpm = np.expm1(pseudobulk_log_cpm)
+    if min_cpm > 0 and min_samples > 0:
+        keep_genes = (pseudobulk_cpm >= min_cpm).sum(axis=0) >= min_samples
+    else:
+        keep_genes = pd.Series(True, index=pseudobulk_log_cpm.columns)
+    gene_filter_df = pd.DataFrame(
+        {
+            "gene": pseudobulk_log_cpm.columns,
+            "n_samples_ge_min_cpm": (pseudobulk_cpm >= min_cpm).sum(axis=0).to_numpy(),
+            "min_cpm": min_cpm,
+            "min_samples": min_samples,
+            "kept_for_pseudobulk_deg": keep_genes.to_numpy(dtype=bool),
+        }
+    )
+    gene_filter_df.to_csv(output_dir / "clz_responsive_cells_pseudobulk_gene_filter.csv", index=False)
+
     rows = []
-    for gene in pseudobulk_log_cpm.columns:
+    for gene in pseudobulk_log_cpm.columns[keep_genes]:
         sz_log = pseudobulk_log_cpm.loc[sz_samples, gene].astype(float).to_numpy()
         control_log = pseudobulk_log_cpm.loc[control_samples, gene].astype(float).to_numpy()
         sz_cpm = np.expm1(sz_log)
@@ -338,11 +368,28 @@ def run_pseudobulk_deg(
             }
         )
 
-    deg_df = pd.DataFrame(rows)
+    result_columns = [
+        "gene",
+        "n_donors_Sz",
+        "n_donors_healthy_control",
+        "mean_logCPM_Sz",
+        "mean_logCPM_healthy_control",
+        "mean_CPM_Sz",
+        "mean_CPM_healthy_control",
+        "log2FC_Sz_vs_healthy_control",
+        "welch_t_statistic",
+        "p_value",
+    ]
+    deg_df = pd.DataFrame(rows, columns=result_columns)
     deg_df["p_adj_bh"] = np.nan
     valid = deg_df["p_value"].notna()
     if valid.any():
         deg_df.loc[valid, "p_adj_bh"] = multipletests(deg_df.loc[valid, "p_value"], method="fdr_bh")[1]
+    deg_df["abs_log2FC"] = deg_df["log2FC_Sz_vs_healthy_control"].abs()
+    deg_df["neg_log10_p_value"] = -np.log10(deg_df["p_value"].fillna(1.0).clip(lower=1e-300))
+    deg_df["neg_log10_p_adj"] = -np.log10(deg_df["p_adj_bh"].fillna(1.0).clip(lower=1e-300))
+    deg_df["signed_neg_log10_p_value"] = np.sign(deg_df["log2FC_Sz_vs_healthy_control"]) * deg_df["neg_log10_p_value"]
+    deg_df["signed_neg_log10_p_adj"] = np.sign(deg_df["log2FC_Sz_vs_healthy_control"]) * deg_df["neg_log10_p_adj"]
     deg_df = deg_df.sort_values(["p_adj_bh", "p_value", "gene"], na_position="last").reset_index(drop=True)
     deg_df.to_csv(output_dir / "clz_responsive_cells_pseudobulk_DEG_Sz_vs_healthy_control.csv", index=False)
     return deg_df
@@ -496,6 +543,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fdr-cutoff", type=float, default=0.05, help="FDR cutoff drawn on volcano plot.")
     parser.add_argument("--logfc-cutoff", type=float, default=0.25, help="Absolute log2FC cutoff drawn on volcano plot.")
     parser.add_argument("--donor-col", default="sample", help="obs column used as donor ID for pseudobulk; one donor becomes n=1.")
+    parser.add_argument("--pseudobulk-min-cpm", type=float, default=1.0, help="Keep genes with CPM >= this value before pseudobulk DEG.")
+    parser.add_argument("--pseudobulk-min-samples", type=int, default=2, help="Keep genes detected above min CPM in at least this many donor pseudobulk samples.")
     parser.add_argument("--skip-pseudobulk", action="store_true", help="Skip donor-level pseudobulk DEG analysis.")
     parser.add_argument("--save-clz-h5ad", action="store_true", help="Save concatenated clozapine-responsive AnnData.")
     return parser.parse_args()
@@ -552,6 +601,8 @@ def main() -> None:
             pseudobulk_log_cpm=pseudobulk_log_cpm,
             pseudobulk_metadata=pseudobulk_metadata,
             output_dir=output_dir,
+            min_cpm=args.pseudobulk_min_cpm,
+            min_samples=args.pseudobulk_min_samples,
         )
         plot_pseudobulk_deg_volcano(
             pseudobulk_deg_df,
