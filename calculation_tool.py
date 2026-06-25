@@ -21,7 +21,7 @@ from matplotlib.colors import ListedColormap
 import matplotlib.patches as mpatches
 
 import itertools
-from tqdm import tqdm 
+from tqdm import tqdm
 
 
 def load_parameters():
@@ -38,55 +38,55 @@ def load_parameters():
     #"HTR3A","HTR4","HTR5A","HTR6","HTR7","DRD1","DRD2","DRD3","DRD4","DRD5",
     #"HRH1","HRH2","HRH3","CHRM1","CHRM2","CHRM3","CHRM4","CHRM5",
     #"ADRA1A","ADRA1B","ADRA2A","ADRA2B","ADRA2C","ADRB1","ADRB2","ADORA1","ADORA2A","ADORA2B","ADORA3"]
-   
+
     return D_R_mtx,GPCR_type_df,drug_list,GPCR_list
 
 def set_parameters_for_preprocess(GPCR_list):
     params = {}  # Create an empty dictionary to store parameters
     # maximum number of cells to load from files
     params["USE_FIRST_N_CELLS"] = 30000
-    
+
     # Set MITO_GENE_PREFIX
     params['MITO_GENE_PREFIX'] = "mt-"
-    
+
     # Set markers
     markers = ["CX3CR1","CLDN5","GLUL","NDRG2","PCDH15","PLP1","MBP","SATB2","SLC17A7",
                "SLC17A6","GAD2","GAD1","SNAP25"]
     markers.extend(GPCR_list)
     params['markers'] = [str.upper() for str in markers]
-    
+
     # Set cell filtering parameters
     params['min_genes_per_cell'] = 200
     params['max_genes_per_cell'] = 6000
-    
+
     # Set gene filtering parameters
     params['min_cells_per_gene'] = 1
     params['n_top_genes'] = 4000
-    
+
     # Set PCA parameters
     params['n_components'] = 50
-    
+
     # Set Batched PCA parameters
     params['pca_train_ratio'] = 0.2
     params['n_pca_batches'] = 10
-    
+
     # Set t-SNE parameters
     params['tsne_n_pcs'] = 20
-    
+
     # Set k-means parameters
     params['k'] = 35
-    
+
     # Set KNN parameters
     params['n_neighbors'] = 15
     params['knn_n_pcs'] = 50
-    
+
     # Set UMAP parameters
     params['umap_min_dist'] = 0.3
     params['umap_spread'] = 1.0
-    
+
     return params
 
-def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True):
+def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True,run_drug_response=True):
     preprocess_start = time.time()
     D_R_mtx,GPCR_type_df,drug_list,GPCR_list=load_parameters()
     # Set parameters
@@ -98,7 +98,7 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
         add_markers = [marker.upper() for marker in add_markers]
         # Append the additional markers to the markers list in the parameters
         params['markers'].extend(add_markers)
-    
+
     #preprocess in bulk
     print("preprocess_in_bulk")
     adata = anndata.read_h5ad(adata_path)
@@ -180,12 +180,13 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
         sc.tl.louvain(adata)
         sc.tl.leiden(adata)
 
-        print("calc drug response")
-        default_drug_conc=100
-        adata=calc_drug_response(adata,GPCR_df,GPCR_type_df,drug_list,D_R_mtx,default_drug_conc)
+        if run_drug_response:
+            print("calc drug response")
+            default_drug_conc=100
+            adata=calc_drug_response(adata,GPCR_df,GPCR_type_df,drug_list,D_R_mtx,default_drug_conc)
 
-        selectivity_threshold=1.2
-        adata,num_clz_selective_cells=calc_clz_selective_cell(adata,drug_list,selectivity_threshold)
+            selectivity_threshold=1.2
+            adata,num_clz_selective_cells=calc_clz_selective_cell(adata,drug_list,selectivity_threshold)
 
         file_root, file_extension = os.path.splitext(adata_path)
         processed_file_path = f"{file_root}_processed{file_extension}"
@@ -210,22 +211,22 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
     sparse_gpu_array = cp.sparse.csr_matrix(adata.X)
     sparse_gpu_array,filtered_barcodes = rapids_scanpy_funcs.filter_cells(sparse_gpu_array, min_genes=params['min_genes_per_cell'],
                                                         max_genes=params['max_genes_per_cell'],barcodes=barcodes)
-    sparse_gpu_array, genes = rapids_scanpy_funcs.filter_genes(sparse_gpu_array, genes, 
+    sparse_gpu_array, genes = rapids_scanpy_funcs.filter_genes(sparse_gpu_array, genes,
                                                             min_cells=params['min_cells_per_gene'])
     raw_counts_snapshot = sparse_gpu_array.copy()
     """sparse_gpu_array, genes, marker_genes_raw = \
-    rapids_scanpy_funcs.preprocess_in_batches(adata_path, 
-                                              params['markers'], 
-                                              min_genes_per_cell=params['min_genes_per_cell'], 
-                                              max_genes_per_cell=params['max_genes_per_cell'], 
-                                              min_cells_per_gene=params['min_cells_per_gene'], 
-                                              target_sum=1e4, 
+    rapids_scanpy_funcs.preprocess_in_batches(adata_path,
+                                              params['markers'],
+                                              min_genes_per_cell=params['min_genes_per_cell'],
+                                              max_genes_per_cell=params['max_genes_per_cell'],
+                                              min_cells_per_gene=params['min_cells_per_gene'],
+                                              target_sum=1e4,
                                               n_top_genes=params['n_top_genes'],
                                               max_cells=params["USE_FIRST_N_CELLS"])
     """
     markers=params['markers'].copy()
     df=genes.to_pandas()
-    
+
     # Before loop: create a set of markers to remove
     markers_to_remove = set()
 
@@ -239,8 +240,8 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
     # After loop: remove the markers that are not found
     for marker in markers_to_remove:
         markers.remove(marker)
-    
-    print(markers)            
+
+    print(markers)
     tmp_norm = sparse_gpu_array.tocsc()
     marker_genes_raw = {
         ("%s_raw" % marker): tmp_norm[:, genes[genes == marker].index[0]].todense().ravel()
@@ -259,16 +260,16 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
     percent_mito = (sparse_gpu_array[:,mito_genes].sum(axis=1) / n_counts).ravel()
     n_counts = cp.array(n_counts).ravel()
     percent_mito = cp.array(percent_mito).ravel()
-    
+
     # regression
     print("perform regression")
-    
+
     sparse_gpu_array = rapids_scanpy_funcs.regress_out(sparse_gpu_array.tocsc(), n_counts, percent_mito)
     del n_counts, percent_mito, mito_genes
     gc.collect()
     cp.get_default_memory_pool().free_all_blocks()
-    
-    
+
+
     # scale
     print("perform scale")
     from sklearn.preprocessing import StandardScaler as SkStandardScaler
@@ -323,10 +324,10 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
     print(sparse_gpu_array.dtype)
     gc.collect()
     cp.get_default_memory_pool().free_all_blocks()
-    
+
     preprocess_time = time.time()
     print("Total Preprocessing time: %s" % (preprocess_time-preprocess_start))
-    
+
     ## Cluster and visualize
     if isinstance(sparse_gpu_array, cp.ndarray):
         adata_matrix = sparse_gpu_array.get()
@@ -348,19 +349,19 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
     else:
         adata.layers["lognorm"] = np.asarray(lognorm_src.X).copy()
     print(f"shape of adata: {adata.X.shape}")
-    
+
     # Restore labels after preprocessing
     if is_label:
         # Convert filtered_barcodes to a pandas Series
         filtered_barcodes_host = filtered_barcodes.to_pandas()  # <- 追加: データをホストに移動
         filtered_labels = original_labels.loc[filtered_barcodes_host].values
         adata.obs["label"] = filtered_labels
-    
+
     del sparse_gpu_array, genes, raw_counts_snapshot
     gc.collect()
     cp.get_default_memory_pool().free_all_blocks()
     print(f"shape of adata: {adata.X.shape}")
-    
+
     GPCR_df=pd.DataFrame()
     for name, data in marker_genes_raw.items():
         adata.obs[name] = data.get()
@@ -373,46 +374,47 @@ def preprocess_adata_in_bulk(adata_path,label=None,add_markers=None,is_gpu=True)
         n_top_genes=params["n_top_genes"],
         subset=False
     )
-        
+
     # Deminsionality reduction
     #We use PCA to reduce the dimensionality of the matrix to its top 50 principal components.
-    #If the number of cells was smaller, we would use the command 
-    # `adata.obsm["X_pca"] = cuml.decomposition.PCA(n_components=n_components, output_type="numpy").fit_transform(adata.X)` 
+    #If the number of cells was smaller, we would use the command
+    # `adata.obsm["X_pca"] = cuml.decomposition.PCA(n_components=n_components, output_type="numpy").fit_transform(adata.X)`
     # to perform PCA on all the cells.
-    #However, we cannot perform PCA on the complete dataset using a single GPU. 
-    # Therefore, we use the batched PCA function in `utils.py`, which uses only a fraction 
+    #However, we cannot perform PCA on the complete dataset using a single GPU.
+    # Therefore, we use the batched PCA function in `utils.py`, which uses only a fraction
     # of the total cells to train PCA.
     print("perform PCA")
     print(params["n_pca_batches"])
-    adata = utils.pca(adata, n_components=params["n_components"], 
-                  train_ratio=params["pca_train_ratio"], 
+    adata = utils.pca(adata, n_components=params["n_components"],
+                  train_ratio=params["pca_train_ratio"],
                   n_batches=params["n_pca_batches"],
                   gpu=is_gpu)
-    
+
     #t-sne + k-means
     print("t-sne")
     #adata=tsne_kmeans(adata,params['tsne_n_pcs'],params['k'])
-    
+
     #UMAP + Graph clustering
     print("UMAP")
     adata=UMAP_adata(adata,params["n_neighbors"],params["knn_n_pcs"],
                      params["umap_min_dist"],params["umap_spread"])
-   
+
     #calculate response to antipsychotics
-    print("calc drug response")
-    default_drug_conc=100
-    adata=calc_drug_response(adata,GPCR_df,GPCR_type_df,drug_list,D_R_mtx,default_drug_conc)
-    
-    #calculate clz selectivity
-    selectivity_threshold=1.2
-    adata,num_clz_selective_cells=calc_clz_selective_cell(adata,drug_list,selectivity_threshold)
-    
-    #save preprocessed adata 
+    if run_drug_response:
+        print("calc drug response")
+        default_drug_conc=100
+        adata=calc_drug_response(adata,GPCR_df,GPCR_type_df,drug_list,D_R_mtx,default_drug_conc)
+
+        #calculate clz selectivity
+        selectivity_threshold=1.2
+        adata,num_clz_selective_cells=calc_clz_selective_cell(adata,drug_list,selectivity_threshold)
+
+    #save preprocessed adata
     file_root, file_extension = os.path.splitext(adata_path)
     # Append '_processed' to the root and add the extension back
     processed_file_path = f"{file_root}_processed{file_extension}"
     adata.write(processed_file_path)
-  
+
     return adata,GPCR_df
 
 def preprocess_adata_in_batch(adata_path,max_cells):
@@ -588,8 +590,8 @@ def tsne_kmeans(adata,tsne_n_pcs,k):
     from cuml.cluster import KMeans
     adata.obsm['X_tsne'] = TSNE().fit_transform(adata.obsm["X_pca"][:,:tsne_n_pcs])
     kmeans = KMeans(n_clusters=k, init="k-means++", random_state=0).fit(adata.obsm['X_pca'])
-    adata.obs['kmeans'] = kmeans.labels_.astype(str) 
-    print("t-sne + k-means")       
+    adata.obs['kmeans'] = kmeans.labels_.astype(str)
+    print("t-sne + k-means")
     sc.pl.tsne(adata, color=["kmeans"])
     return adata
 
@@ -615,13 +617,13 @@ def calc_drug_response(adata,GPCR_df,GPCR_type_df,drug_list,D_R_mtx,drug_conc):
     norm_df=pd.DataFrame(GPCR_adata_norm)
     norm_col=[str[:-4] for str in GPCR_df.columns]
     norm_df.columns=norm_col
-    
+
     GPCR_type_df=GPCR_type_df[GPCR_type_df.receptor_name.isin(norm_col)]
-    
+
     Gs=GPCR_type_df[GPCR_type_df.type=="Gs"]["receptor_name"].values
     Gi=GPCR_type_df[GPCR_type_df.type=="Gi"]["receptor_name"].values
     Gq=GPCR_type_df[GPCR_type_df.type=="Gq"]["receptor_name"].values
-    
+
     cAMP_df=pd.DataFrame(columns=drug_list)
     Ca_df=pd.DataFrame(columns=drug_list)
     for drug in drug_list:
@@ -640,14 +642,14 @@ def calc_drug_response(adata,GPCR_df,GPCR_type_df,drug_list,D_R_mtx,drug_conc):
     for drug in drug_list:
         adata.obs['cAMP_%s'%drug]=cAMP_df[drug]
         adata.obs['Ca_%s'%drug]=Ca_df[drug]
-        
+
     return adata
 
 def calc_clz_selective_cell(adata,drug_list,selectivity_threshold):
     adata.obs["is_clz_activated"]=np.zeros(len(adata.obs))
     adata.obs["is_clz_activated"][adata.obs["cAMP_CLOZAPINE"]>10]=1
     adata.obs["is_clz_activated"]=adata.obs["is_clz_activated"].astype("category")
-    
+
     adata.obs["is_clz_inhibited"]=np.zeros(len(adata.obs))
     adata.obs["is_clz_inhibited"][adata.obs["cAMP_CLOZAPINE"]<-10]=1
     adata.obs["is_clz_inhibited"]=adata.obs["is_clz_inhibited"].astype("category")
@@ -671,10 +673,10 @@ def calc_clz_selective_cell(adata,drug_list,selectivity_threshold):
     adata.obs["cAMP_clz_selectivity"] = (adata.obs["cAMP_CLOZAPINE"] ** 2) / (adata.obs["cAMP_mean_other_than_czp"] ** 2)
 
     # selectivity_threshold と cAMP_CLOZAPINE > 0 の条件を満たす細胞をカテゴリ型でラベル付け
-    adata.obs["is_clz_selective"] = (((adata.obs["cAMP_clz_selectivity"] > selectivity_threshold) & 
+    adata.obs["is_clz_selective"] = (((adata.obs["cAMP_clz_selectivity"] > selectivity_threshold) &
                                     (adata.obs["cAMP_CLOZAPINE"] > 0))
                                     ).astype("category")
-    
+
     print("clz selective cells")
     print("# of clz selective cells:",adata.obs["is_clz_selective"].value_counts())
     num_clz_selective = adata.obs["is_clz_selective"].value_counts()[True]
@@ -702,7 +704,7 @@ def create_GPCR_pattern(n_pattern):
             unique_patterns_set.add(pattern_str)
             pattern_dict[f"Pattern_{i+1}"] = {gpcr: bool(val) for gpcr, val in zip(GPCR_list2, random_pattern)}
             i += 1
-            
+
     # pattern_dictをデータフレームに変換
     pattern_df = pd.DataFrame.from_dict(pattern_dict, orient='index').reset_index(drop=True)
     return pattern_df
@@ -741,11 +743,11 @@ def drug_titeration(adata, GPCR_df, GPCR_type_df, drug_list, D_R_mtx):
     plt.xlabel("Drug Concentration (nM)")
     plt.ylabel("Number of Clozapine Selective Cells")
     plt.title("Clozapine Selectivity vs. Drug Concentration")
-    plt.ylim(bottom=0) 
+    plt.ylim(bottom=0)
     #plt.grid(True)
     plt.show()
 
-def sim_inhibit_pattern(adata, GPCR_adata_norm_df, GPCR_type_df, drug_conc, 
+def sim_inhibit_pattern(adata, GPCR_adata_norm_df, GPCR_type_df, drug_conc,
                           group_col="is_clz_selective", selected_label=True, n_pattern=10000):
     """
     adata: シングルセル解析の AnnData オブジェクト。adata.obs に群情報 (例: "is_clz_selective") 等が含まれる。
@@ -900,13 +902,13 @@ def sim_inhibit_pattern_3r(adata, GPCR_adata_norm_df, GPCR_type_df, drug_conc,gr
     # GPCR_adata_norm_df: 正規化済み GPCR 発現データの DataFrame（行=細胞, 列=受容体名）
     # GPCR_type_df: 受容体タイプの DataFrame（列: receptor_name, type）; type は "Gs", "Gi" 等
     # drug_conc: 薬剤濃度（scalar）
-    
+
  # 進捗バー用ライブラリ
 
     # 1. adata.obs の group_col に基づき、グループ分けするためのマスクを作成
     mask = adata.obs[group_col] == selected_label
     mask.index = pd.RangeIndex(start=0, stop=adata.obs[group_col].shape[0], step=1)
-    
+
     # 2. GPCR のリストおよび GPCR_type_df のフィルタリング
     # "Unnamed: 0" を除外したカラムリストを作成
     GPCR_list2 = [col for col in GPCR_adata_norm_df.columns if col != "Unnamed: 0"]
@@ -948,7 +950,7 @@ def sim_inhibit_pattern_3r(adata, GPCR_adata_norm_df, GPCR_type_df, drug_conc,gr
         gi_effect = (expression_df[Gi_cols].divide(1 + drug_conc / effective_Ki[Gi_cols])).sum(axis=1)
         basal_cAMP = (expression_df[Gs_cols] - expression_df[Gi_cols]).sum(axis=1)
         cAMPmod = (gs_effect - gi_effect) - basal_cAMP
-        
+
         responses = cAMPmod  # 各細胞ごとの cAMPmod の Series
         return responses
 
@@ -984,7 +986,7 @@ def visualize_patterns(results_df_sorted, top_n=None, top_n_for_heatmap=None, sc
       top_n: ヒートマップ（従来版）および棒グラフで表示する上位パターン数（Noneの場合は全パターン）
       top_n_for_heatmap: 拡大版ヒートマップで表示する上位パターン数（Noneの場合は表示しない）
       scatter_n: 散布図にプロットするパターン数（Noneの場合は全パターン）
-    
+
     Display:
       1. ヒートマップ（従来版）:
          - X軸: 受容体名（"_raw" を除去）、X軸ラベルは90°回転
@@ -1005,7 +1007,7 @@ def visualize_patterns(results_df_sorted, top_n=None, top_n_for_heatmap=None, sc
     else:
         df_subset = results_df_sorted.copy().reset_index(drop=True)
     n_patterns_subset = df_subset.shape[0]
-    
+
     # ヒートマップ描画用のヘルパー関数
     def plot_heatmap(df, version_label):
         n_patterns = df.shape[0]
@@ -1013,67 +1015,67 @@ def visualize_patterns(results_df_sorted, top_n=None, top_n_for_heatmap=None, sc
         first_pattern = df.iloc[0]['pattern']
         receptor_keys = list(first_pattern.keys())
         receptors = [key.replace('_raw', '') for key in receptor_keys]
-        
+
         # 各パターンの辞書をバイナリ行列に変換（True→1, False→0）
         pattern_matrix = np.zeros((n_patterns, len(receptors)), dtype=int)
         for i, row in df.iterrows():
             pat = row['pattern']
             for j, key in enumerate(receptor_keys):
                 pattern_matrix[i, j] = 1 if pat.get(key, False) else 0
-        
+
         # パターン番号ラベル（1～）
         pattern_labels = [str(i + 1) for i in range(n_patterns)]
-        
+
         # 二値用離散カラーマップ（False: white, True: steelblue）
         cmap = ListedColormap(['white', 'steelblue'])
-        
+
         # ヒートマップ描画
         fig, ax = plt.subplots(figsize=(12, max(6, n_patterns * 0.3)))
         im = ax.imshow(pattern_matrix, aspect='auto', cmap=cmap)
-        
+
         # X軸：受容体名（90°回転）
         ax.set_xticks(np.arange(len(receptors)))
         ax.set_xticklabels(receptors, rotation=90, ha='center')
         ax.set_xlabel('Receptor Name')
-        
+
         # Y軸：パターン番号
         ax.set_yticks(np.arange(n_patterns))
         ax.set_yticklabels(pattern_labels)
         ax.set_ylabel('Pattern (sorted by diff descending)')
         ax.set_title(f'Pattern Visualization ({version_label}) (Top {n_patterns} Patterns)')
-        
+
         # legend を右側に配置
         false_patch = mpatches.Patch(color=cmap(0), label='False')
         true_patch = mpatches.Patch(color=cmap(1), label='True')
         ax.legend(handles=[false_patch, true_patch], title='Value',
                   bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
-        
+
         # legend 分の余白を確保
         plt.tight_layout(rect=[0, 0, 0.85, 1])
         plt.show()
-    
+
     # 1. ヒートマップ（従来版）：df_subset を使用
     plot_heatmap(df_subset, version_label="")
-    
+
     # 2. ヒートマップ（拡大版）：top_n_for_heatmap が指定されている場合
     if top_n_for_heatmap is not None:
         df_enlarge = results_df_sorted.head(top_n_for_heatmap).reset_index(drop=True)
         plot_heatmap(df_enlarge, version_label="")
-    
+
     # 3. 棒グラフ: df_subset をもとに各受容体の True の割合 (%) を計算
     first_pattern = df_subset.iloc[0]['pattern']
     receptor_keys = list(first_pattern.keys())
     receptors = [key.replace('_raw', '') for key in receptor_keys]
-    
+
     pattern_matrix = np.zeros((n_patterns_subset, len(receptors)), dtype=int)
     for i, row in df_subset.iterrows():
         pat = row['pattern']
         for j, key in enumerate(receptor_keys):
             pattern_matrix[i, j] = 1 if pat.get(key, False) else 0
-            
+
     true_counts = pattern_matrix.sum(axis=0)
     true_percentage = (true_counts / n_patterns_subset) * 100
-    
+
     fig2, ax2 = plt.subplots(figsize=(12, 4))
     ax2.bar(np.arange(len(receptors)), true_percentage)
     ax2.set_xlabel('Receptor Name')
@@ -1081,14 +1083,14 @@ def visualize_patterns(results_df_sorted, top_n=None, top_n_for_heatmap=None, sc
     ax2.set_title(f'True Percentage per Receptor (Top {n_patterns_subset} Patterns)')
     ax2.set_xticks(np.arange(len(receptors)))
     ax2.set_xticklabels(receptors, rotation=90, ha='center')
-    
+
     # 空の legend を追加して右側の余白を確保（ダミーパッチを追加）
     dummy_patch = mpatches.Patch(color='none', label='')
     ax2.legend(handles=[dummy_patch], bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
-    
+
     plt.tight_layout(rect=[0, 0, 0.85, 1])
     plt.show()
-    
+
     # 4. 散布図: scatter_n に指定があればその上位パターン、指定がなければ全パターン
     if scatter_n is not None:
         df_scatter = results_df_sorted.head(scatter_n).reset_index(drop=True)
@@ -1100,7 +1102,7 @@ def visualize_patterns(results_df_sorted, top_n=None, top_n_for_heatmap=None, sc
     # 50刻みのtickを設定
     ticks = np.arange(0, total_patterns, 50)
     tick_labels = [str(tick+1) for tick in ticks]
-    
+
     fig3, ax3 = plt.subplots(figsize=(12, 4))
     ax3.scatter(np.arange(total_patterns), df_scatter['diff'], s=10)
     ax3.set_xlabel('Pattern (sorted by diff descending)')
@@ -1108,7 +1110,7 @@ def visualize_patterns(results_df_sorted, top_n=None, top_n_for_heatmap=None, sc
     ax3.set_title(f'Diff Values for Top {total_patterns} Patterns (sorted descending)')
     ax3.set_xticks(ticks)
     ax3.set_xticklabels(tick_labels, rotation=90, ha='center')
-    
+
     plt.tight_layout()
     plt.show()
 
@@ -1220,4 +1222,3 @@ def compute_camp_response_for_pattern(
     print("n_nonselective:", summary["n_nonselective"])
 
     return df_plot, summary
-
