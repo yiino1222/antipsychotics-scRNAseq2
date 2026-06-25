@@ -13,6 +13,8 @@ backend keeps text editable by embedding TrueType fonts (fonttype 42).
 from __future__ import annotations
 
 import argparse
+import shutil
+import subprocess
 from pathlib import Path
 
 import anndata
@@ -395,6 +397,95 @@ def run_pseudobulk_deg(
     return deg_df
 
 
+def write_edger_deseq2_scripts(output_dir: Path) -> tuple[Path, Path]:
+    """Write runnable R scripts for edgeR and DESeq2 pseudobulk DEG."""
+    edge_r_script = output_dir / "run_pseudobulk_edgeR.R"
+    deseq2_script = output_dir / "run_pseudobulk_DESeq2.R"
+    edge_r_script.write_text(
+        r'''
+suppressPackageStartupMessages({
+  library(edgeR)
+})
+
+out_dir <- normalizePath(".", mustWork = TRUE)
+counts_path <- file.path(out_dir, "clz_responsive_cells_pseudobulk_counts_for_deseq2_edger.csv")
+coldata_path <- file.path(out_dir, "clz_responsive_cells_pseudobulk_coldata_for_deseq2_edger.csv")
+
+counts <- read.csv(counts_path, row.names = 1, check.names = FALSE)
+coldata <- read.csv(coldata_path, row.names = 1, check.names = FALSE)
+counts <- round(as.matrix(counts))
+counts <- counts[, rownames(coldata), drop = FALSE]
+coldata$diagnosis_group <- relevel(factor(coldata$diagnosis_group), ref = "healthy_control")
+
+y <- DGEList(counts = counts, samples = coldata, group = coldata$diagnosis_group)
+design <- model.matrix(~ diagnosis_group, data = coldata)
+keep <- filterByExpr(y, design = design)
+write.csv(
+  data.frame(gene = rownames(y), kept_by_filterByExpr = keep),
+  file.path(out_dir, "clz_responsive_cells_pseudobulk_edgeR_gene_filter.csv"),
+  row.names = FALSE
+)
+y <- y[keep, , keep.lib.sizes = FALSE]
+y <- calcNormFactors(y)
+y <- estimateDisp(y, design)
+fit <- glmQLFit(y, design)
+qlf <- glmQLFTest(fit, coef = "diagnosis_groupSz")
+res <- topTags(qlf, n = Inf, sort.by = "PValue")$table
+res$gene <- rownames(res)
+res <- res[, c("gene", setdiff(colnames(res), "gene"))]
+write.csv(res, file.path(out_dir, "clz_responsive_cells_pseudobulk_edgeR_DEG_Sz_vs_healthy_control.csv"), row.names = FALSE)
+'''.lstrip(),
+        encoding="utf-8",
+    )
+    deseq2_script.write_text(
+        r'''
+suppressPackageStartupMessages({
+  library(DESeq2)
+})
+
+out_dir <- normalizePath(".", mustWork = TRUE)
+counts_path <- file.path(out_dir, "clz_responsive_cells_pseudobulk_counts_for_deseq2_edger.csv")
+coldata_path <- file.path(out_dir, "clz_responsive_cells_pseudobulk_coldata_for_deseq2_edger.csv")
+
+counts <- read.csv(counts_path, row.names = 1, check.names = FALSE)
+coldata <- read.csv(coldata_path, row.names = 1, check.names = FALSE)
+counts <- round(as.matrix(counts))
+counts <- counts[, rownames(coldata), drop = FALSE]
+coldata$diagnosis_group <- relevel(factor(coldata$diagnosis_group), ref = "healthy_control")
+
+dds <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData = coldata,
+  design = ~ diagnosis_group
+)
+keep <- rowSums(counts(dds)) >= 10
+write.csv(
+  data.frame(gene = rownames(dds), kept_by_rowSum10 = keep),
+  file.path(out_dir, "clz_responsive_cells_pseudobulk_DESeq2_gene_filter.csv"),
+  row.names = FALSE
+)
+dds <- dds[keep, ]
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("diagnosis_group", "Sz", "healthy_control"))
+res_df <- as.data.frame(res)
+res_df$gene <- rownames(res_df)
+res_df <- res_df[, c("gene", setdiff(colnames(res_df), "gene"))]
+res_df <- res_df[order(res_df$padj, res_df$pvalue, na.last = TRUE), ]
+write.csv(res_df, file.path(out_dir, "clz_responsive_cells_pseudobulk_DESeq2_DEG_Sz_vs_healthy_control.csv"), row.names = FALSE)
+'''.lstrip(),
+        encoding="utf-8",
+    )
+    return edge_r_script, deseq2_script
+
+
+def run_r_script(script_path: Path) -> None:
+    """Run an R script with Rscript in the script directory."""
+    rscript = shutil.which("Rscript")
+    if rscript is None:
+        raise RuntimeError("Rscript was not found on PATH; install R or run the generated R script manually.")
+    subprocess.run([rscript, str(script_path.name)], cwd=script_path.parent, check=True)
+
+
 def save_prediction_summaries(sz_adata: anndata.AnnData, control_adata: anndata.AnnData, output_dir: Path) -> None:
     """Save cell-level annotations and clozapine-responsive counts."""
     summary = pd.DataFrame(
@@ -545,6 +636,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--donor-col", default="sample", help="obs column used as donor ID for pseudobulk; one donor becomes n=1.")
     parser.add_argument("--pseudobulk-min-cpm", type=float, default=1.0, help="Keep genes with CPM >= this value before pseudobulk DEG.")
     parser.add_argument("--pseudobulk-min-samples", type=int, default=2, help="Keep genes detected above min CPM in at least this many donor pseudobulk samples.")
+    parser.add_argument("--run-edger", action="store_true", help="Run generated edgeR pseudobulk DEG script with Rscript.")
+    parser.add_argument("--run-deseq2", action="store_true", help="Run generated DESeq2 pseudobulk DEG script with Rscript.")
     parser.add_argument("--skip-pseudobulk", action="store_true", help="Skip donor-level pseudobulk DEG analysis.")
     parser.add_argument("--save-clz-h5ad", action="store_true", help="Save concatenated clozapine-responsive AnnData.")
     return parser.parse_args()
@@ -610,6 +703,11 @@ def main() -> None:
             args.fdr_cutoff,
             args.logfc_cutoff,
         )
+        edge_r_script, deseq2_script = write_edger_deseq2_scripts(output_dir)
+        if args.run_edger:
+            run_r_script(edge_r_script)
+        if args.run_deseq2:
+            run_r_script(deseq2_script)
 
     if args.save_clz_h5ad:
         clz_adata.write(output_dir / "clz_responsive_cells_Sz_and_healthy_control.h5ad")
