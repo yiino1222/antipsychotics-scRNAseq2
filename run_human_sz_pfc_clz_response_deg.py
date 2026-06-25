@@ -207,6 +207,58 @@ def concatenate_clz_responsive(sz_adata: anndata.AnnData, control_adata: anndata
     return combined
 
 
+def _obs_marker_score(adata: anndata.AnnData, genes: list[str]) -> pd.Series:
+    """Score marker raw-count columns stored in ``adata.obs``."""
+    score = pd.Series(0.0, index=adata.obs_names)
+    for gene in genes:
+        raw_col = f"{gene}_raw"
+        if raw_col in adata.obs.columns:
+            score = score + pd.to_numeric(adata.obs[raw_col], errors="coerce").fillna(0.0)
+    return score
+
+
+def annotate_broad_cell_types(clz_adata: anndata.AnnData, output_dir: Path) -> anndata.AnnData:
+    """Annotate broad clozapine-responsive cell classes from retained marker raw counts."""
+    adata = clz_adata.copy()
+    inhibitory_score = _obs_marker_score(adata, ["GAD1", "GAD2"])
+    excitatory_score = _obs_marker_score(adata, ["SLC17A7", "SLC17A6", "SATB2"])
+    non_neuronal_score = _obs_marker_score(adata, ["CX3CR1", "CLDN5", "GLUL", "NDRG2", "PCDH15", "PLP1", "MBP"])
+    neuronal_score = _obs_marker_score(adata, ["SNAP25"])
+
+    broad_type = pd.Series("unclassified", index=adata.obs_names, dtype="object")
+    broad_type.loc[(non_neuronal_score > 0) & (neuronal_score <= 0)] = "non_neuronal"
+    broad_type.loc[excitatory_score > 0] = "excitatory"
+    broad_type.loc[inhibitory_score > 0] = "inhibitory"
+    broad_type.loc[
+        (broad_type == "unclassified") & (non_neuronal_score > excitatory_score) & (non_neuronal_score > inhibitory_score)
+    ] = "non_neuronal"
+
+    adata.obs["broad_cell_type"] = pd.Categorical(
+        broad_type,
+        categories=["excitatory", "inhibitory", "non_neuronal", "unclassified"],
+    )
+    marker_scores = pd.DataFrame(
+        {
+            "excitatory_marker_score": excitatory_score,
+            "inhibitory_marker_score": inhibitory_score,
+            "non_neuronal_marker_score": non_neuronal_score,
+            "neuronal_marker_score": neuronal_score,
+            "broad_cell_type": adata.obs["broad_cell_type"].astype(str),
+            "diagnosis_group": adata.obs["diagnosis_group"].astype(str),
+        },
+        index=adata.obs_names,
+    )
+    marker_scores.to_csv(output_dir / "clz_responsive_cells_broad_cell_type_annotations.csv")
+    (
+        adata.obs.groupby(["broad_cell_type", "diagnosis_group"], observed=False)
+        .size()
+        .rename("n_cells")
+        .reset_index()
+        .to_csv(output_dir / "clz_responsive_cells_broad_cell_type_counts.csv", index=False)
+    )
+    return adata
+
+
 def run_deg(clz_adata: anndata.AnnData, output_dir: Path, method: str) -> pd.DataFrame:
     """Run Scanpy DEG for Sz vs healthy control among clozapine-responsive cells."""
     deg_adata = clz_adata.copy()
@@ -486,6 +538,138 @@ def run_r_script(script_path: Path) -> None:
     subprocess.run([rscript, str(script_path.name)], cwd=script_path.parent, check=True)
 
 
+def parse_gmt(gmt_path: str | Path) -> dict[str, set[str]]:
+    """Read a GMT gene-set file."""
+    gene_sets: dict[str, set[str]] = {}
+    with open(gmt_path, encoding="utf-8") as handle:
+        for line in handle:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) >= 3:
+                gene_sets[fields[0]] = {gene.upper() for gene in fields[2:] if gene}
+    return gene_sets
+
+
+def _weighted_enrichment_score(ranked_genes: list[str], rank_values: np.ndarray, gene_set: set[str]) -> float:
+    """Compute a weighted preranked GSEA enrichment score."""
+    hits = np.array([gene in gene_set for gene in ranked_genes], dtype=bool)
+    n_hits = int(hits.sum())
+    n_genes = len(ranked_genes)
+    if n_hits == 0 or n_hits == n_genes:
+        return np.nan
+    hit_weights = np.abs(rank_values[hits])
+    hit_weights_sum = hit_weights.sum()
+    if hit_weights_sum == 0:
+        hit_weights = np.ones(n_hits) / n_hits
+    else:
+        hit_weights = hit_weights / hit_weights_sum
+    miss_weight = 1.0 / (n_genes - n_hits)
+    running = np.empty(n_genes, dtype=float)
+    running[hits] = hit_weights
+    running[~hits] = -miss_weight
+    cumulative = np.cumsum(running)
+    max_es = cumulative.max()
+    min_es = cumulative.min()
+    return float(max_es if abs(max_es) >= abs(min_es) else min_es)
+
+
+def run_preranked_gsea(
+    deg_df: pd.DataFrame,
+    gmt_path: str | Path,
+    output_path: Path,
+    min_size: int,
+    max_size: int,
+    permutations: int,
+    seed: int,
+) -> pd.DataFrame:
+    """Run a lightweight preranked GSEA using DEG direction and p-value rank."""
+    if deg_df.empty:
+        result = pd.DataFrame()
+        result.to_csv(output_path, index=False)
+        return result
+
+    rank_df = deg_df.dropna(subset=["gene", "log2FC_Sz_vs_healthy_control"]).copy()
+    p_col = "p_value" if "p_value" in rank_df.columns else "pvals"
+    rank_df[p_col] = pd.to_numeric(rank_df[p_col], errors="coerce").fillna(1.0)
+    rank_df["rank_metric"] = (
+        np.sign(pd.to_numeric(rank_df["log2FC_Sz_vs_healthy_control"], errors="coerce"))
+        * -np.log10(rank_df[p_col].clip(lower=1e-300))
+    )
+    rank_df = rank_df.replace([np.inf, -np.inf], np.nan).dropna(subset=["rank_metric"])
+    rank_df["gene_upper"] = rank_df["gene"].astype(str).str.upper()
+    rank_df = rank_df.sort_values("rank_metric", ascending=False).drop_duplicates("gene_upper")
+    ranked_genes = rank_df["gene_upper"].tolist()
+    rank_values = rank_df["rank_metric"].to_numpy(dtype=float)
+    gene_sets = parse_gmt(gmt_path)
+    rng = np.random.default_rng(seed)
+
+    rows = []
+    for pathway, genes in gene_sets.items():
+        overlap = set(ranked_genes).intersection(genes)
+        if len(overlap) < min_size or len(overlap) > max_size:
+            continue
+        es = _weighted_enrichment_score(ranked_genes, rank_values, overlap)
+        if np.isnan(es):
+            continue
+        null_es = np.array(
+            [
+                _weighted_enrichment_score(ranked_genes, rng.permutation(rank_values), overlap)
+                for _ in range(permutations)
+            ],
+            dtype=float,
+        )
+        if es >= 0:
+            same_tail = null_es[null_es >= 0]
+            p_value = (np.sum(same_tail >= es) + 1) / (len(same_tail) + 1) if len(same_tail) else 1.0
+            nes = es / np.mean(same_tail) if len(same_tail) and np.mean(same_tail) != 0 else np.nan
+        else:
+            same_tail = null_es[null_es < 0]
+            p_value = (np.sum(same_tail <= es) + 1) / (len(same_tail) + 1) if len(same_tail) else 1.0
+            nes = es / abs(np.mean(same_tail)) if len(same_tail) and np.mean(same_tail) != 0 else np.nan
+        rows.append(
+            {
+                "pathway": pathway,
+                "size": len(overlap),
+                "ES": es,
+                "NES": nes,
+                "p_value": p_value,
+                "leading_edge_genes": ";".join([gene for gene in ranked_genes if gene in overlap][:50]),
+            }
+        )
+
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result["p_adj_bh"] = multipletests(result["p_value"], method="fdr_bh")[1]
+        result = result.sort_values(["p_adj_bh", "p_value", "pathway"]).reset_index(drop=True)
+    result.to_csv(output_path, index=False)
+    return result
+
+
+def plot_gsea_dotplot(gsea_df: pd.DataFrame, output_path: Path, title: str, top_n: int = 20) -> None:
+    """Plot top GSEA pathways as an Illustrator-editable PDF."""
+    if gsea_df.empty:
+        return
+    plot_df = gsea_df.sort_values(["p_adj_bh", "p_value"]).head(top_n).copy()
+    plot_df["neg_log10_fdr"] = -np.log10(plot_df["p_adj_bh"].fillna(1.0).clip(lower=1e-300))
+    fig_height = max(4.0, 0.28 * len(plot_df) + 1.5)
+    fig, ax = plt.subplots(figsize=(7.0, fig_height))
+    sns.scatterplot(
+        data=plot_df,
+        x="NES",
+        y="pathway",
+        size="size",
+        hue="neg_log10_fdr",
+        palette="viridis",
+        ax=ax,
+    )
+    ax.axvline(0, color="black", linewidth=0.8)
+    ax.set_title(title)
+    ax.set_xlabel("Normalized enrichment score (NES)")
+    ax.set_ylabel("")
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
 def save_prediction_summaries(sz_adata: anndata.AnnData, control_adata: anndata.AnnData, output_dir: Path) -> None:
     """Save cell-level annotations and clozapine-responsive counts."""
     summary = pd.DataFrame(
@@ -619,6 +803,83 @@ def plot_top_gene_heatmap(clz_adata: anndata.AnnData, deg_df: pd.DataFrame, outp
     plt.close(fig)
 
 
+def run_stratified_cell_type_analyses(
+    clz_adata: anndata.AnnData,
+    output_dir: Path,
+    args: argparse.Namespace,
+) -> None:
+    """Run DEG, pseudobulk DEG, optional R runners, and optional GSEA per broad cell type."""
+    celltype_root = output_dir / "broad_cell_type_stratified"
+    celltype_root.mkdir(parents=True, exist_ok=True)
+    summary_rows = []
+    for cell_type in ["excitatory", "inhibitory", "non_neuronal"]:
+        subset = clz_adata[clz_adata.obs["broad_cell_type"].astype(str) == cell_type].copy()
+        group_counts = subset.obs["diagnosis_group"].astype(str).value_counts()
+        celltype_dir = celltype_root / cell_type
+        celltype_dir.mkdir(parents=True, exist_ok=True)
+        summary_rows.append(
+            {
+                "broad_cell_type": cell_type,
+                "n_cells": int(subset.n_obs),
+                "n_cells_Sz": int(group_counts.get("Sz", 0)),
+                "n_cells_healthy_control": int(group_counts.get("healthy_control", 0)),
+                "ran_analysis": bool(group_counts.get("Sz", 0) > 0 and group_counts.get("healthy_control", 0) > 0),
+            }
+        )
+        if group_counts.get("Sz", 0) == 0 or group_counts.get("healthy_control", 0) == 0:
+            continue
+
+        deg_df = run_deg(subset, celltype_dir, args.deg_method)
+        plot_deg_volcano(deg_df, celltype_dir, args.fdr_cutoff, args.logfc_cutoff)
+        plot_top_gene_heatmap(subset, deg_df, celltype_dir, args.top_n_heatmap)
+        if args.gmt:
+            gsea_df = run_preranked_gsea(
+                deg_df=deg_df,
+                gmt_path=args.gmt,
+                output_path=celltype_dir / "cell_level_preranked_GSEA.csv",
+                min_size=args.gsea_min_size,
+                max_size=args.gsea_max_size,
+                permutations=args.gsea_permutations,
+                seed=args.gsea_seed,
+            )
+            plot_gsea_dotplot(gsea_df, celltype_dir / "cell_level_preranked_GSEA_dotplot.pdf", f"{cell_type} cell-level GSEA")
+
+        if args.skip_pseudobulk:
+            continue
+        pseudobulk_counts, pseudobulk_log_cpm, pseudobulk_metadata = make_pseudobulk_tables(
+            clz_adata=subset,
+            donor_col=args.donor_col,
+            output_dir=celltype_dir,
+        )
+        pseudobulk_deg_df = run_pseudobulk_deg(
+            pseudobulk_counts=pseudobulk_counts,
+            pseudobulk_log_cpm=pseudobulk_log_cpm,
+            pseudobulk_metadata=pseudobulk_metadata,
+            output_dir=celltype_dir,
+            min_cpm=args.pseudobulk_min_cpm,
+            min_samples=args.pseudobulk_min_samples,
+        )
+        plot_pseudobulk_deg_volcano(pseudobulk_deg_df, celltype_dir, args.fdr_cutoff, args.logfc_cutoff)
+        if args.gmt:
+            gsea_df = run_preranked_gsea(
+                deg_df=pseudobulk_deg_df,
+                gmt_path=args.gmt,
+                output_path=celltype_dir / "pseudobulk_preranked_GSEA.csv",
+                min_size=args.gsea_min_size,
+                max_size=args.gsea_max_size,
+                permutations=args.gsea_permutations,
+                seed=args.gsea_seed,
+            )
+            plot_gsea_dotplot(gsea_df, celltype_dir / "pseudobulk_preranked_GSEA_dotplot.pdf", f"{cell_type} pseudobulk GSEA")
+        edge_r_script, deseq2_script = write_edger_deseq2_scripts(celltype_dir)
+        if args.run_edger:
+            run_r_script(edge_r_script)
+        if args.run_deseq2:
+            run_r_script(deseq2_script)
+
+    pd.DataFrame(summary_rows).to_csv(celltype_root / "broad_cell_type_stratified_analysis_summary.csv", index=False)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sz-h5ad", default=DEFAULT_SZ_H5AD, help="Schizophrenia AnnData h5ad path.")
@@ -638,6 +899,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pseudobulk-min-samples", type=int, default=2, help="Keep genes detected above min CPM in at least this many donor pseudobulk samples.")
     parser.add_argument("--run-edger", action="store_true", help="Run generated edgeR pseudobulk DEG script with Rscript.")
     parser.add_argument("--run-deseq2", action="store_true", help="Run generated DESeq2 pseudobulk DEG script with Rscript.")
+    parser.add_argument("--skip-cell-type-stratified", action="store_true", help="Skip excitatory/inhibitory/non-neuronal stratified DEG.")
+    parser.add_argument("--gmt", default=None, help="GMT gene-set file for preranked GSEA.")
+    parser.add_argument("--gsea-min-size", type=int, default=10, help="Minimum overlap size for preranked GSEA.")
+    parser.add_argument("--gsea-max-size", type=int, default=500, help="Maximum overlap size for preranked GSEA.")
+    parser.add_argument("--gsea-permutations", type=int, default=1000, help="Number of rank permutations for preranked GSEA p-values.")
+    parser.add_argument("--gsea-seed", type=int, default=0, help="Random seed for preranked GSEA permutations.")
     parser.add_argument("--skip-pseudobulk", action="store_true", help="Skip donor-level pseudobulk DEG analysis.")
     parser.add_argument("--save-clz-h5ad", action="store_true", help="Save concatenated clozapine-responsive AnnData.")
     return parser.parse_args()
@@ -678,10 +945,21 @@ def main() -> None:
     save_prediction_summaries(sz_adata, control_adata, output_dir)
     plot_response_counts(output_dir)
 
-    clz_adata = concatenate_clz_responsive(sz_adata, control_adata)
+    clz_adata = annotate_broad_cell_types(concatenate_clz_responsive(sz_adata, control_adata), output_dir)
     deg_df = run_deg(clz_adata, output_dir, args.deg_method)
     plot_deg_volcano(deg_df, output_dir, args.fdr_cutoff, args.logfc_cutoff)
     plot_top_gene_heatmap(clz_adata, deg_df, output_dir, args.top_n_heatmap)
+    if args.gmt:
+        gsea_df = run_preranked_gsea(
+            deg_df=deg_df,
+            gmt_path=args.gmt,
+            output_path=output_dir / "cell_level_preranked_GSEA.csv",
+            min_size=args.gsea_min_size,
+            max_size=args.gsea_max_size,
+            permutations=args.gsea_permutations,
+            seed=args.gsea_seed,
+        )
+        plot_gsea_dotplot(gsea_df, output_dir / "cell_level_preranked_GSEA_dotplot.pdf", "All clz-responsive cell-level GSEA")
 
     if not args.skip_pseudobulk:
         pseudobulk_counts, pseudobulk_log_cpm, pseudobulk_metadata = make_pseudobulk_tables(
@@ -708,6 +986,20 @@ def main() -> None:
             run_r_script(edge_r_script)
         if args.run_deseq2:
             run_r_script(deseq2_script)
+        if args.gmt:
+            gsea_df = run_preranked_gsea(
+                deg_df=pseudobulk_deg_df,
+                gmt_path=args.gmt,
+                output_path=output_dir / "pseudobulk_preranked_GSEA.csv",
+                min_size=args.gsea_min_size,
+                max_size=args.gsea_max_size,
+                permutations=args.gsea_permutations,
+                seed=args.gsea_seed,
+            )
+            plot_gsea_dotplot(gsea_df, output_dir / "pseudobulk_preranked_GSEA_dotplot.pdf", "All clz-responsive pseudobulk GSEA")
+
+    if not args.skip_cell_type_stratified:
+        run_stratified_cell_type_analyses(clz_adata, output_dir, args)
 
     if args.save_clz_h5ad:
         clz_adata.write(output_dir / "clz_responsive_cells_Sz_and_healthy_control.h5ad")
